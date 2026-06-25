@@ -21,3 +21,8 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+### Quick Dock runtime files
+# 실행 중 생성되는 로그와 설정 백업
+env/quick_dock.log
+*.ini.bak

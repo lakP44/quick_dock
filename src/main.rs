@@ -29,11 +29,16 @@ const TOAST_DURATION_MILLISECONDS: u64 = 1800;
 const SCREEN_EDGE_DROP_DISTANCE: f32 = 96.0;
 const CONFIGURATION_DIRECTORY_NAME: &str = "env";
 const CONFIGURATION_FILE_NAME: &str = "quick_dock.ini";
+const LOG_FILE_NAME: &str = "quick_dock.log";
+const SCHEMA_VERSION: u32 = 1;
+const AUTOSTART_VALUE_NAME: &str = "QuickDock";
 
 fn main() -> eframe::Result {
     let Some(_single_instance_guard) = SingleInstanceGuard::acquire() else {
         return Ok(());
     };
+
+    log_event("Quick Dock 시작");
 
     let initial_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
 
@@ -68,9 +73,6 @@ impl SingleInstanceGuard {
         use std::ptr::null;
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
         use windows_sys::Win32::System::Threading::CreateMutexW;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
-        };
 
         let mutex_name = wide_null(OsStr::new("Local\\QuickDockSingleInstance"));
         let handle = unsafe { CreateMutexW(null(), 1, mutex_name.as_ptr()) };
@@ -80,21 +82,32 @@ impl SingleInstanceGuard {
         }
 
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            let message = wide_null(OsStr::new("Quick Dock가 이미 실행 중입니다."));
-            let title = wide_null(OsStr::new("Quick Dock"));
+            focus_existing_instance_window();
             unsafe {
-                MessageBoxW(
-                    std::ptr::null_mut(),
-                    message.as_ptr(),
-                    title.as_ptr(),
-                    MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
-                );
                 CloseHandle(handle);
             }
             return None;
         }
 
         Some(Self { handle })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn focus_existing_instance_window() {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+
+    let title = wide_null(OsStr::new("Quick Dock"));
+    unsafe {
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !window.is_null() {
+            ShowWindow(window, SW_SHOW);
+            ShowWindow(window, SW_RESTORE);
+            SetForegroundWindow(window);
+        }
     }
 }
 
@@ -142,6 +155,25 @@ impl DockEdge {
             DockEdge::Bottom => "아래쪽",
         }
     }
+
+    fn ini_value(self) -> &'static str {
+        match self {
+            DockEdge::Left => "left",
+            DockEdge::Right => "right",
+            DockEdge::Top => "top",
+            DockEdge::Bottom => "bottom",
+        }
+    }
+
+    fn from_ini_value(value: &str) -> Option<DockEdge> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "left" => Some(DockEdge::Left),
+            "right" => Some(DockEdge::Right),
+            "top" => Some(DockEdge::Top),
+            "bottom" => Some(DockEdge::Bottom),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +199,24 @@ impl ActionItem {
             ActionItem::CopyText { name, .. } => name,
             ActionItem::RunApplication { name, .. } => name,
             ActionItem::OpenPath { name, .. } => name,
+        }
+    }
+
+    fn kind(&self) -> ActionKind {
+        match self {
+            ActionItem::CopyText { .. } => ActionKind::CopyText,
+            ActionItem::RunApplication { .. } => ActionKind::RunApplication,
+            ActionItem::OpenPath { .. } => ActionKind::OpenPath,
+        }
+    }
+
+    fn search_payload(&self) -> String {
+        match self {
+            ActionItem::CopyText { text, .. } => text.clone(),
+            ActionItem::RunApplication {
+                command, arguments, ..
+            } => format!("{command} {}", arguments.join(" ")),
+            ActionItem::OpenPath { path, .. } => path.clone(),
         }
     }
 }
@@ -312,6 +362,19 @@ enum EditorActionRequest {
     Status { message: String, is_error: bool },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ButtonActionRequest {
+    Execute(usize),
+    RunAsAdmin(usize),
+    OpenItemLocation(usize),
+    CopyItemPath(usize),
+    EditItem(usize),
+    DuplicateItem(usize),
+    MoveUp(usize),
+    MoveDown(usize),
+    Remove(usize),
+}
+
 #[derive(Debug, Clone)]
 struct QuickDockTab {
     name: String,
@@ -395,6 +458,32 @@ struct ResizeDrag {
     start_window_rect: egui::Rect,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MonitorDockState {
+    edge: DockEdge,
+    anchor: egui::Pos2,
+    expanded_size: egui::Vec2,
+}
+
+#[derive(Debug, Clone)]
+struct LayoutSettings {
+    expanded_size: egui::Vec2,
+    window_size: egui::Vec2,
+    dock_edge: DockEdge,
+    monitors: BTreeMap<String, MonitorDockState>,
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            expanded_size: default_expanded_size(),
+            window_size: egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT),
+            dock_edge: DockEdge::Left,
+            monitors: BTreeMap::new(),
+        }
+    }
+}
+
 struct QuickDockApplication {
     configuration_path: PathBuf,
     tabs: Vec<QuickDockTab>,
@@ -406,7 +495,10 @@ struct QuickDockApplication {
     drag_drop_target: Option<DragDropTarget>,
     drag_pointer_offset: egui::Vec2,
     expanded_resize_drag: Option<ResizeDrag>,
+    window_resize_drag: Option<ResizeDrag>,
     expanded_size: egui::Vec2,
+    window_size: egui::Vec2,
+    monitor_dock_states: BTreeMap<String, MonitorDockState>,
     renaming_tab_index: Option<usize>,
     renaming_focus_pending: bool,
     is_settings_editor_open: bool,
@@ -423,6 +515,46 @@ struct QuickDockApplication {
     last_known_monitor_rect: egui::Rect,
     available_monitor_rects: Vec<egui::Rect>,
     dock_anchor_position: egui::Pos2,
+    pending_input_copy: Option<PendingInputCopy>,
+    last_external_foreground_window: Option<isize>,
+    editor_focus_index: Option<usize>,
+    palette_open: bool,
+    palette_query: String,
+    palette_selected: usize,
+    palette_focus_pending: bool,
+    recent_items: Vec<ActionItem>,
+    autostart_enabled: bool,
+    #[cfg(target_os = "windows")]
+    tray_state: Option<TrayState>,
+    #[cfg(target_os = "windows")]
+    tray_attempted: bool,
+}
+
+#[cfg(target_os = "windows")]
+struct TrayState {
+    _icon: tray_icon::TrayIcon,
+    autostart_item: tray_icon::menu::CheckMenuItem,
+}
+
+struct PaletteEntry {
+    item: ActionItem,
+    tab_index: Option<usize>,
+    tab_label: String,
+    is_recent: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingInputCopy {
+    name: String,
+    template: String,
+    fields: Vec<TemplateInputField>,
+    focus_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TemplateInputField {
+    label: String,
+    value: String,
 }
 
 impl QuickDockApplication {
@@ -430,9 +562,14 @@ impl QuickDockApplication {
         configure_system_fonts(&creation_context.egui_ctx);
 
         let configuration_path = get_configuration_path();
-        let (tabs, expanded_size, status_message) =
-            load_tabs_from_configuration(&configuration_path);
+        let (tabs, layout, status_message) = load_tabs_from_configuration(&configuration_path);
         let next_tab_number = tabs.len() + 1;
+        let LayoutSettings {
+            expanded_size,
+            window_size,
+            dock_edge,
+            monitors,
+        } = layout;
 
         Self {
             configuration_path,
@@ -440,12 +577,15 @@ impl QuickDockApplication {
             active_tab_index: 0,
             next_tab_number,
             new_item_kind: ActionKind::CopyText,
-            dock_edge: DockEdge::Left,
+            dock_edge,
             highlighted_dock_edge: None,
             drag_drop_target: None,
             drag_pointer_offset: egui::vec2(24.0, 16.0),
             expanded_resize_drag: None,
+            window_resize_drag: None,
             expanded_size,
+            window_size,
+            monitor_dock_states: monitors,
             renaming_tab_index: None,
             renaming_focus_pending: false,
             is_settings_editor_open: false,
@@ -468,14 +608,30 @@ impl QuickDockApplication {
                 egui::vec2(1920.0, 1080.0),
             )],
             dock_anchor_position: egui::pos2(0.0, INITIAL_Y + COLLAPSED_LENGTH * 0.5),
+            pending_input_copy: None,
+            last_external_foreground_window: None,
+            editor_focus_index: None,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
+            palette_focus_pending: false,
+            recent_items: Vec::new(),
+            autostart_enabled: is_autostart_enabled(),
+            #[cfg(target_os = "windows")]
+            tray_state: None,
+            #[cfg(target_os = "windows")]
+            tray_attempted: false,
         }
     }
 
     fn reload_configuration(&mut self) {
-        let (tabs, expanded_size, status_message) =
+        let (tabs, layout, status_message) =
             load_tabs_from_configuration(&self.configuration_path);
         self.tabs = tabs;
-        self.expanded_size = expanded_size;
+        self.expanded_size = layout.expanded_size;
+        self.window_size = layout.window_size;
+        self.dock_edge = layout.dock_edge;
+        self.monitor_dock_states = layout.monitors;
         self.active_tab_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
         self.next_tab_number = self.tabs.len() + 1;
         self.renaming_tab_index = None;
@@ -487,6 +643,10 @@ impl QuickDockApplication {
         let viewport_info = context.input(|input| input.viewport().clone());
 
         self.update_monitor_rect(context, frame, &viewport_info);
+
+        if let Some(external_window) = current_external_foreground_window() {
+            self.last_external_foreground_window = Some(external_window);
+        }
 
         if let Some(outer_rect) = viewport_info.outer_rect {
             self.last_known_position = outer_rect.min;
@@ -508,12 +668,18 @@ impl QuickDockApplication {
             return;
         }
 
+        if self.window_resize_drag.is_some() {
+            self.update_window_resize(context);
+            context.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+
         if !self.is_docked {
             context.request_repaint_after(Duration::from_millis(80));
             return;
         }
 
-        if self.is_settings_editor_open {
+        if self.is_settings_editor_open || self.pending_input_copy.is_some() || self.palette_open {
             self.last_hovered_at = Instant::now();
             if !self.is_expanded {
                 self.is_expanded = true;
@@ -670,11 +836,12 @@ impl QuickDockApplication {
             self.drag_drop_target = Some(DragDropTarget::Window { monitor_rect });
             self.is_expanded = true;
 
-            let target_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
+            let target_size = self.window_size;
             let target_position = normal_window_position_for_cursor(
                 cursor_position,
                 self.drag_pointer_offset,
                 monitor_rect,
+                target_size,
             );
             self.send_drag_preview_geometry(context, target_size, target_position);
             self.last_status_message = "창 모드 미리보기".to_owned();
@@ -711,11 +878,12 @@ impl QuickDockApplication {
         monitor_rect: egui::Rect,
         context: &egui::Context,
     ) {
-        let target_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
+        let target_size = self.window_size;
         let target_position = normal_window_position_for_cursor(
             cursor_position,
             self.drag_pointer_offset,
             monitor_rect,
+            target_size,
         );
 
         self.highlighted_dock_edge = None;
@@ -858,11 +1026,102 @@ impl QuickDockApplication {
         self.save_layout_settings();
     }
 
+    fn begin_window_resize(&mut self, edge: ResizeEdge, context: &egui::Context) {
+        let start_window_rect = egui::Rect::from_min_size(self.last_known_position, self.window_size);
+        self.window_resize_drag = Some(ResizeDrag {
+            edge,
+            start_window_rect,
+        });
+        self.last_status_message = "창 크기를 조절하는 중입니다.".to_owned();
+        context.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+    }
+
+    fn update_window_resize(&mut self, context: &egui::Context) {
+        let pointer_released = context.input(|input| input.pointer.any_released());
+        let primary_down = is_primary_mouse_button_down().unwrap_or_else(|| {
+            context.input(|input| input.pointer.button_down(egui::PointerButton::Primary))
+        });
+
+        if pointer_released || !primary_down {
+            self.finish_window_resize(context);
+            return;
+        }
+
+        let Some(resize_drag) = self.window_resize_drag else {
+            return;
+        };
+        let Some(cursor_position) = self.current_cursor_position(context) else {
+            return;
+        };
+
+        let mut resized_rect = resize_drag.start_window_rect;
+        if resize_drag.edge.affects_left() {
+            resized_rect.min.x = cursor_position.x;
+        }
+        if resize_drag.edge.affects_right() {
+            resized_rect.max.x = cursor_position.x;
+        }
+        if resize_drag.edge.affects_top() {
+            resized_rect.min.y = cursor_position.y;
+        }
+        if resize_drag.edge.affects_bottom() {
+            resized_rect.max.y = cursor_position.y;
+        }
+
+        resized_rect =
+            clamp_free_window_rect(resized_rect, resize_drag.edge, self.last_known_monitor_rect);
+        self.window_size = resized_rect.size();
+        self.last_known_position = resized_rect.min;
+
+        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.window_size));
+        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.last_known_position));
+    }
+
+    fn finish_window_resize(&mut self, context: &egui::Context) {
+        self.window_resize_drag = None;
+        context.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.window_size));
+        self.last_status_message = "창 크기를 저장했습니다.".to_owned();
+        self.save_layout_settings();
+    }
+
+    fn current_layout(&self) -> LayoutSettings {
+        LayoutSettings {
+            expanded_size: self.expanded_size,
+            window_size: self.window_size,
+            dock_edge: self.dock_edge,
+            monitors: self.monitor_dock_states.clone(),
+        }
+    }
+
+    fn record_current_monitor_state(&mut self) {
+        let key = monitor_key(self.last_known_monitor_rect);
+        self.monitor_dock_states.insert(
+            key,
+            MonitorDockState {
+                edge: self.dock_edge,
+                anchor: self.dock_anchor_position,
+                expanded_size: self.expanded_size,
+            },
+        );
+    }
+
+    fn restore_monitor_state_for_current(&mut self) {
+        let key = monitor_key(self.last_known_monitor_rect);
+        if let Some(state) = self.monitor_dock_states.get(&key).copied() {
+            self.expanded_size =
+                clamp_expanded_size_to_monitor(state.expanded_size, self.last_known_monitor_rect);
+        }
+    }
+
     fn save_layout_settings(&mut self) {
+        self.record_current_monitor_state();
+        let layout = self.current_layout();
         if let Err(error) =
-            save_tabs_to_configuration(&self.configuration_path, &self.tabs, self.expanded_size)
+            save_tabs_to_configuration(&self.configuration_path, &self.tabs, &layout, false)
         {
             self.last_status_message = format!("창 크기 저장 실패: {error}");
+            log_event(&format!("레이아웃 저장 실패: {error}"));
         }
     }
 
@@ -907,6 +1166,7 @@ impl QuickDockApplication {
         self.is_dragging = false;
         self.dock_anchor_position =
             clamp_pos_to_rect(anchor_position, self.last_known_monitor_rect);
+        self.restore_monitor_state_for_current();
         self.last_known_position = get_docked_position(
             edge,
             self.dock_anchor_position,
@@ -915,6 +1175,7 @@ impl QuickDockApplication {
         );
         self.last_status_message = format!("{}에 도킹했습니다.", edge.korean_name());
         self.apply_dock_geometry(context);
+        self.save_layout_settings();
     }
 
     fn add_tab(&mut self) {
@@ -958,6 +1219,7 @@ impl QuickDockApplication {
             .map(EditableActionItem::from_action_item)
             .collect();
         self.is_settings_editor_open = true;
+        self.editor_focus_index = None;
         self.last_status_message = "설정을 편집 중입니다.".to_owned();
     }
 
@@ -978,12 +1240,14 @@ impl QuickDockApplication {
         let active_index = self.active_tab_index;
         self.tabs[active_index].items = items.clone();
 
-        match save_tabs_to_configuration(&self.configuration_path, &self.tabs, self.expanded_size) {
+        let layout = self.current_layout();
+        match save_tabs_to_configuration(&self.configuration_path, &self.tabs, &layout, true) {
             Ok(()) => {
                 self.last_status_message =
                     "설정을 저장했습니다. 이전 파일은 quick_dock.ini.bak에 백업했습니다."
                         .to_owned();
                 self.is_settings_editor_open = false;
+                self.editor_focus_index = None;
                 self.last_hovered_at = Instant::now();
             }
             Err(error) => {
@@ -1000,6 +1264,7 @@ impl QuickDockApplication {
             .map(EditableActionItem::from_action_item)
             .collect();
         self.is_settings_editor_open = false;
+        self.editor_focus_index = None;
         self.last_hovered_at = Instant::now();
         self.last_status_message = "설정 편집을 취소했습니다.".to_owned();
     }
@@ -1267,15 +1532,27 @@ impl QuickDockApplication {
                 } else if self.active_tab().items.is_empty() {
                     ui.label("env\\quick_dock.ini에 등록된 항목이 없습니다.");
                 } else {
-                    egui::ScrollArea::vertical()
+                    let pending_request = egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             let items = self.active_tab().items.clone();
-                            for item in items {
-                                self.show_action_button(ui, &item);
+                            let item_count = items.len();
+                            let mut pending = None;
+                            for (index, item) in items.iter().enumerate() {
+                                if let Some(request) =
+                                    self.show_action_button(ui, index, item_count, item)
+                                {
+                                    pending = Some(request);
+                                }
                                 ui.add_space(4.0);
                             }
-                        });
+                            pending
+                        })
+                        .inner;
+
+                    if let Some(request) = pending_request {
+                        self.handle_button_action_request(request);
+                    }
                 }
 
                 ui.separator();
@@ -1289,10 +1566,11 @@ impl QuickDockApplication {
     }
 
     fn show_expanded_resize_handles(&mut self, ui: &mut egui::Ui, frame_rect: egui::Rect) {
-        if !self.is_docked || !self.is_expanded || self.is_dragging {
+        if !self.is_expanded || self.is_dragging {
             return;
         }
 
+        let is_docked = self.is_docked;
         let context = ui.ctx().clone();
         for (edge, rect) in resize_handle_rects(frame_rect, self.dock_edge) {
             let response = ui.interact(
@@ -1306,45 +1584,251 @@ impl QuickDockApplication {
             }
 
             if response.drag_started_by(egui::PointerButton::Primary) {
-                self.begin_expanded_resize(edge, &context);
+                if is_docked {
+                    self.begin_expanded_resize(edge, &context);
+                } else {
+                    self.begin_window_resize(edge, &context);
+                }
             }
         }
     }
 
-    fn show_action_button(&mut self, ui: &mut egui::Ui, item: &ActionItem) {
+    fn show_action_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        item_count: usize,
+        item: &ActionItem,
+    ) -> Option<ButtonActionRequest> {
+        let mut request = None;
         let button_label = format_action_button_label(item);
         let response = ui.add_sized(
             [ui.available_width(), 34.0],
             egui::Button::new(button_label),
         );
 
-        match item {
-            ActionItem::CopyText { name, text } => {
-                let response = response.on_hover_ui(|ui| {
-                    show_copy_text_preview(ui, name, text);
-                });
+        let response = if let ActionItem::CopyText { name, text } = item {
+            response.on_hover_ui(|ui| show_copy_text_preview(ui, name, text))
+        } else {
+            response
+        };
 
-                let mut copy_from_context_menu = false;
-                response.context_menu(|ui| {
+        response.context_menu(|ui| {
+            ui.set_min_width(160.0);
+
+            match item {
+                ActionItem::CopyText { name, text } => {
                     show_copy_text_preview(ui, name, text);
                     ui.separator();
-
                     if ui.button("복사").clicked() {
-                        copy_from_context_menu = true;
+                        request = Some(ButtonActionRequest::Execute(index));
                         ui.close();
                     }
-                });
-
-                if response.clicked() || copy_from_context_menu {
-                    self.copy_text_to_clipboard(name, text);
+                }
+                ActionItem::RunApplication { .. } => {
+                    if ui.button("실행").clicked() {
+                        request = Some(ButtonActionRequest::Execute(index));
+                        ui.close();
+                    }
+                    if ui.button("관리자 권한으로 실행").clicked() {
+                        request = Some(ButtonActionRequest::RunAsAdmin(index));
+                        ui.close();
+                    }
+                    if ui.button("파일 위치 열기").clicked() {
+                        request = Some(ButtonActionRequest::OpenItemLocation(index));
+                        ui.close();
+                    }
+                    if ui.button("경로 복사").clicked() {
+                        request = Some(ButtonActionRequest::CopyItemPath(index));
+                        ui.close();
+                    }
+                }
+                ActionItem::OpenPath { .. } => {
+                    if ui.button("열기").clicked() {
+                        request = Some(ButtonActionRequest::Execute(index));
+                        ui.close();
+                    }
+                    if ui.button("탐색기에서 선택").clicked() {
+                        request = Some(ButtonActionRequest::OpenItemLocation(index));
+                        ui.close();
+                    }
+                    if ui.button("경로 복사").clicked() {
+                        request = Some(ButtonActionRequest::CopyItemPath(index));
+                        ui.close();
+                    }
                 }
             }
-            _ => {
-                if response.clicked() {
-                    self.execute_action(item);
+
+            ui.separator();
+            if ui.button("편집").clicked() {
+                request = Some(ButtonActionRequest::EditItem(index));
+                ui.close();
+            }
+            if ui.button("복제").clicked() {
+                request = Some(ButtonActionRequest::DuplicateItem(index));
+                ui.close();
+            }
+            if ui
+                .add_enabled(index > 0, egui::Button::new("위로"))
+                .clicked()
+            {
+                request = Some(ButtonActionRequest::MoveUp(index));
+                ui.close();
+            }
+            if ui
+                .add_enabled(index + 1 < item_count, egui::Button::new("아래로"))
+                .clicked()
+            {
+                request = Some(ButtonActionRequest::MoveDown(index));
+                ui.close();
+            }
+            if ui.button("삭제").clicked() {
+                request = Some(ButtonActionRequest::Remove(index));
+                ui.close();
+            }
+        });
+
+        if response.clicked() {
+            request = Some(ButtonActionRequest::Execute(index));
+        }
+
+        request
+    }
+
+    fn handle_button_action_request(&mut self, request: ButtonActionRequest) {
+        let item_index = match request {
+            ButtonActionRequest::Execute(index)
+            | ButtonActionRequest::RunAsAdmin(index)
+            | ButtonActionRequest::OpenItemLocation(index)
+            | ButtonActionRequest::CopyItemPath(index)
+            | ButtonActionRequest::EditItem(index)
+            | ButtonActionRequest::DuplicateItem(index)
+            | ButtonActionRequest::MoveUp(index)
+            | ButtonActionRequest::MoveDown(index)
+            | ButtonActionRequest::Remove(index) => index,
+        };
+
+        let Some(item) = self.active_tab().items.get(item_index).cloned() else {
+            return;
+        };
+
+        match request {
+            ButtonActionRequest::Execute(_) => {
+                self.record_recent(&item);
+                self.execute_action(&item);
+            }
+            ButtonActionRequest::RunAsAdmin(_) => self.run_item_as_admin(&item),
+            ButtonActionRequest::OpenItemLocation(_) => self.open_item_location(&item),
+            ButtonActionRequest::CopyItemPath(_) => self.copy_item_path(&item),
+            ButtonActionRequest::EditItem(_) => self.open_settings_editor_at(item_index),
+            ButtonActionRequest::DuplicateItem(_) => {
+                let active_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+                self.tabs[active_index]
+                    .items
+                    .insert(item_index + 1, item.clone());
+                self.commit_active_items(format!("복제했습니다: {}", item.name()));
+            }
+            ButtonActionRequest::MoveUp(_) => {
+                if item_index > 0 {
+                    let active_index =
+                        self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+                    self.tabs[active_index].items.swap(item_index, item_index - 1);
+                    self.commit_active_items("순서를 변경했습니다.");
                 }
+            }
+            ButtonActionRequest::MoveDown(_) => {
+                let active_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+                if item_index + 1 < self.tabs[active_index].items.len() {
+                    self.tabs[active_index].items.swap(item_index, item_index + 1);
+                    self.commit_active_items("순서를 변경했습니다.");
+                }
+            }
+            ButtonActionRequest::Remove(_) => {
+                let active_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+                self.tabs[active_index].items.remove(item_index);
+                self.commit_active_items(format!("삭제했습니다: {}", item.name()));
             }
         }
+    }
+
+    fn commit_active_items(&mut self, status: impl Into<String>) {
+        let active_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+        self.tabs[active_index].editable_items = self.tabs[active_index]
+            .items
+            .iter()
+            .map(EditableActionItem::from_action_item)
+            .collect();
+
+        let layout = self.current_layout();
+        match save_tabs_to_configuration(&self.configuration_path, &self.tabs, &layout, true) {
+            Ok(()) => self.last_status_message = status.into(),
+            Err(error) => {
+                self.last_status_message = format!("저장 실패: {error}");
+                self.show_toast("저장 실패", true);
+            }
+        }
+    }
+
+    fn open_settings_editor_at(&mut self, index: usize) {
+        self.open_settings_editor();
+        self.editor_focus_index = Some(index);
+        self.last_status_message = format!("{}번째 항목을 편집합니다.", index + 1);
+    }
+
+    fn run_item_as_admin(&mut self, item: &ActionItem) {
+        let ActionItem::RunApplication {
+            name,
+            command,
+            arguments,
+        } = item
+        else {
+            return;
+        };
+
+        match run_application_as_admin(command, arguments) {
+            Ok(()) => {
+                self.last_status_message = format!("관리자 권한으로 실행: {name}");
+                self.show_toast("관리자 권한으로 실행", false);
+            }
+            Err(message) => {
+                self.last_status_message = format!("관리자 실행 실패: {message}");
+                self.show_toast("관리자 실행 실패", true);
+            }
+        }
+    }
+
+    fn open_item_location(&mut self, item: &ActionItem) {
+        let target = match item {
+            ActionItem::RunApplication { command, .. } => {
+                resolve_application_command_for_spawn(command)
+            }
+            ActionItem::OpenPath { path, .. } => resolve_open_path_for_spawn(path),
+            ActionItem::CopyText { .. } => return,
+        };
+
+        match target.and_then(|path| reveal_in_file_explorer(&path)) {
+            Ok(()) => {
+                self.last_status_message = "파일 위치를 열었습니다.".to_owned();
+                self.show_toast("파일 위치 열기", false);
+            }
+            Err(message) => {
+                self.last_status_message = format!("파일 위치 열기 실패: {message}");
+                self.show_toast("파일 위치 열기 실패", true);
+            }
+        }
+    }
+
+    fn copy_item_path(&mut self, item: &ActionItem) {
+        let path_text = match item {
+            ActionItem::RunApplication { command, .. } => {
+                resolve_application_command_for_spawn(command)
+                    .unwrap_or_else(|_| normalize_command_text(command))
+            }
+            ActionItem::OpenPath { path, .. } => normalize_command_text(path),
+            ActionItem::CopyText { .. } => return,
+        };
+
+        self.set_clipboard_text("경로", &path_text);
     }
 
     fn show_header(&mut self, ui: &mut egui::Ui) {
@@ -1394,6 +1878,10 @@ impl QuickDockApplication {
             });
 
             ui.horizontal_wrapped(|ui| {
+                if ui.small_button("검색").clicked() {
+                    self.toggle_palette();
+                }
+
                 if ui.small_button("새 탭").clicked() {
                     self.add_tab();
                 }
@@ -1404,6 +1892,15 @@ impl QuickDockApplication {
 
                 if ui.small_button("탐색기 정리").clicked() {
                     self.close_related_explorer_windows();
+                }
+
+                let autostart_label = if self.autostart_enabled {
+                    "자동시작 ✓"
+                } else {
+                    "자동시작"
+                };
+                if ui.small_button(autostart_label).clicked() {
+                    self.toggle_autostart();
                 }
 
                 if ui.small_button("설정").clicked() {
@@ -1544,9 +2041,13 @@ impl QuickDockApplication {
                         shorten_text(&self.active_tab().editable_items[index].name, 24)
                     );
 
-                    let response = egui::CollapsingHeader::new(title)
-                        .id_salt(("setting_item", index))
-                        .default_open(index == 0)
+                    let header = egui::CollapsingHeader::new(title)
+                        .id_salt(("setting_item", index));
+                    let header = match self.editor_focus_index {
+                        Some(focus) if focus == index => header.open(Some(true)),
+                        _ => header.default_open(index == 0),
+                    };
+                    let response = header
                         .show(ui, |ui| {
                             let item = &mut self.active_tab_mut().editable_items[index];
                             if let Some(request) = show_editable_action_item(ui, index, item) {
@@ -1613,7 +2114,7 @@ impl QuickDockApplication {
     fn execute_action(&mut self, item: &ActionItem) {
         match item {
             ActionItem::CopyText { name, text } => {
-                self.copy_text_to_clipboard(name, text);
+                self.begin_copy(name, text);
             }
             ActionItem::RunApplication {
                 name,
@@ -1628,7 +2129,52 @@ impl QuickDockApplication {
         }
     }
 
-    fn copy_text_to_clipboard(&mut self, name: &str, text: &str) {
+    fn begin_copy(&mut self, name: &str, text: &str) {
+        let labels = extract_input_labels(text);
+        if labels.is_empty() {
+            let selection_text = self.selection_text_for_template(text);
+            let expanded = expand_copy_template(text, &[], &selection_text);
+            self.set_clipboard_text(name, &expanded);
+            return;
+        }
+
+        self.pending_input_copy = Some(PendingInputCopy {
+            name: name.to_owned(),
+            template: text.to_owned(),
+            fields: labels
+                .into_iter()
+                .map(|label| TemplateInputField {
+                    label,
+                    value: String::new(),
+                })
+                .collect(),
+            focus_pending: true,
+        });
+        self.last_status_message = "값을 입력한 뒤 복사합니다.".to_owned();
+    }
+
+    fn confirm_pending_input_copy(&mut self) {
+        let Some(pending) = self.pending_input_copy.take() else {
+            return;
+        };
+        let selection_text = self.selection_text_for_template(&pending.template);
+        let expanded = expand_copy_template(&pending.template, &pending.fields, &selection_text);
+        self.set_clipboard_text(&pending.name, &expanded);
+    }
+
+    fn selection_text_for_template(&self, template: &str) -> String {
+        if template.contains("{selection}") {
+            self.capture_selection_text().unwrap_or_default()
+        } else {
+            String::new()
+        }
+    }
+
+    fn capture_selection_text(&self) -> Option<String> {
+        capture_selection_text(self.last_external_foreground_window)
+    }
+
+    fn set_clipboard_text(&mut self, name: &str, text: &str) {
         match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_owned())) {
             Ok(()) => {
                 self.last_status_message = format!("복사되었습니다: {name}");
@@ -1639,6 +2185,369 @@ impl QuickDockApplication {
                 self.show_toast("복사 실패", true);
             }
         }
+    }
+
+    fn show_pending_input_modal(&mut self, context: &egui::Context) {
+        if self.pending_input_copy.is_none() {
+            return;
+        }
+
+        context.request_repaint_after(Duration::from_millis(80));
+
+        // 모달이 열린 첫 프레임에는 Enter를 무시한다.
+        // (팔레트에서 Enter로 연 경우 같은 Enter가 모달을 즉시 확정하는 것을 막는다.)
+        let just_opened = self
+            .pending_input_copy
+            .as_ref()
+            .map(|pending| pending.focus_pending)
+            .unwrap_or(false);
+
+        let mut confirm = false;
+        let mut cancel = false;
+
+        egui::Area::new(egui::Id::new("quick_dock_input_backdrop"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(context, |ui| {
+                let backdrop_rect = ui.ctx().content_rect();
+                ui.painter().rect_filled(
+                    backdrop_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                );
+                ui.allocate_rect(backdrop_rect, egui::Sense::click_and_drag());
+            });
+
+        let pending_name = self
+            .pending_input_copy
+            .as_ref()
+            .map(|pending| pending.name.clone())
+            .unwrap_or_default();
+
+        egui::Window::new(format!("입력: {}", shorten_text(&pending_name, 18)))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(context, |ui| {
+                ui.set_min_width(240.0);
+                if let Some(pending) = self.pending_input_copy.as_mut() {
+                    for (index, field) in pending.fields.iter_mut().enumerate() {
+                        ui.label(egui::RichText::new(&field.label).strong());
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut field.value)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("값 입력"),
+                        );
+                        if pending.focus_pending && index == 0 {
+                            response.request_focus();
+                            pending.focus_pending = false;
+                        }
+                        ui.add_space(6.0);
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("복사").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("취소").clicked() {
+                        cancel = true;
+                    }
+                    ui.label(
+                        egui::RichText::new("Enter 복사 · Esc 취소")
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+
+        if !just_opened && context.input(|input| input.key_pressed(egui::Key::Enter)) {
+            confirm = true;
+        }
+        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+
+        if confirm {
+            self.confirm_pending_input_copy();
+        } else if cancel {
+            self.pending_input_copy = None;
+            self.last_status_message = "복사를 취소했습니다.".to_owned();
+        }
+    }
+
+    fn ensure_tray_icon(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            if self.tray_state.is_some() || self.tray_attempted {
+                return;
+            }
+            self.tray_attempted = true;
+            match build_tray_state(self.autostart_enabled) {
+                Ok(state) => self.tray_state = Some(state),
+                Err(error) => log_event(&format!("트레이 아이콘 생성 실패: {error}")),
+            }
+        }
+    }
+
+    fn poll_tray_events(&mut self, context: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+                if event.id == "tray_open" {
+                    self.bring_to_front(context);
+                } else if event.id == "tray_settings" {
+                    self.bring_to_front(context);
+                    if !self.is_settings_editor_open {
+                        self.open_settings_editor();
+                    }
+                } else if event.id == "tray_autostart" {
+                    self.toggle_autostart();
+                    if let Some(state) = &self.tray_state {
+                        state.autostart_item.set_checked(self.autostart_enabled);
+                    }
+                } else if event.id == "tray_quit" {
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+
+            while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+                if let tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                } = event
+                {
+                    self.bring_to_front(context);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        let _ = context;
+    }
+
+    fn bring_to_front(&mut self, context: &egui::Context) {
+        self.is_expanded = true;
+        if self.is_docked {
+            self.apply_dock_geometry(context);
+        }
+        context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.last_hovered_at = Instant::now();
+    }
+
+    fn toggle_autostart(&mut self) {
+        let target = !self.autostart_enabled;
+        match set_autostart(target) {
+            Ok(()) => {
+                self.autostart_enabled = target;
+                let message = if target {
+                    "Windows 시작 시 자동 실행을 켰습니다."
+                } else {
+                    "자동 실행을 껐습니다."
+                };
+                self.last_status_message = message.to_owned();
+                self.show_toast(message, false);
+                log_event(&format!("자동 실행 설정: {target}"));
+            }
+            Err(error) => {
+                self.last_status_message = format!("자동 실행 설정 실패: {error}");
+                self.show_toast("자동 실행 설정 실패", true);
+                log_event(&format!("자동 실행 설정 실패: {error}"));
+            }
+        }
+    }
+
+    fn toggle_palette(&mut self) {
+        self.palette_open = !self.palette_open;
+        if self.palette_open {
+            self.palette_query.clear();
+            self.palette_selected = 0;
+            self.palette_focus_pending = true;
+            self.last_status_message = "검색: 이름·내용·탭".to_owned();
+        }
+    }
+
+    fn record_recent(&mut self, item: &ActionItem) {
+        self.recent_items
+            .retain(|existing| existing.kind() != item.kind() || existing.name() != item.name());
+        self.recent_items.insert(0, item.clone());
+        self.recent_items.truncate(8);
+    }
+
+    fn build_palette_entries(&self) -> Vec<PaletteEntry> {
+        let query = self.palette_query.trim().to_lowercase();
+        let mut entries = Vec::new();
+
+        if query.is_empty() {
+            for item in &self.recent_items {
+                entries.push(PaletteEntry {
+                    item: item.clone(),
+                    tab_index: None,
+                    tab_label: "최근".to_owned(),
+                    is_recent: true,
+                });
+            }
+            for (tab_index, tab) in self.tabs.iter().enumerate() {
+                for item in &tab.items {
+                    entries.push(PaletteEntry {
+                        item: item.clone(),
+                        tab_index: Some(tab_index),
+                        tab_label: tab.name.clone(),
+                        is_recent: false,
+                    });
+                }
+            }
+        } else {
+            for (tab_index, tab) in self.tabs.iter().enumerate() {
+                for item in &tab.items {
+                    let haystack = format!("{} {} {}", tab.name, item.name(), item.search_payload())
+                        .to_lowercase();
+                    if haystack.contains(&query) {
+                        entries.push(PaletteEntry {
+                            item: item.clone(),
+                            tab_index: Some(tab_index),
+                            tab_label: tab.name.clone(),
+                            is_recent: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        entries.truncate(80);
+        entries
+    }
+
+    fn show_palette(&mut self, context: &egui::Context) {
+        if !self.palette_open {
+            return;
+        }
+
+        context.request_repaint_after(Duration::from_millis(80));
+
+        let entries = self.build_palette_entries();
+        let entry_count = entries.len();
+        self.palette_selected = if entry_count == 0 {
+            0
+        } else {
+            self.palette_selected.min(entry_count - 1)
+        };
+
+        let mut execute_now = false;
+        let mut close_now = false;
+        context.input(|input| {
+            if entry_count > 0 && input.key_pressed(egui::Key::ArrowDown) {
+                self.palette_selected = (self.palette_selected + 1) % entry_count;
+            }
+            if entry_count > 0 && input.key_pressed(egui::Key::ArrowUp) {
+                self.palette_selected = (self.palette_selected + entry_count - 1) % entry_count;
+            }
+            if input.key_pressed(egui::Key::Enter) {
+                execute_now = true;
+            }
+            if input.key_pressed(egui::Key::Escape) {
+                close_now = true;
+            }
+        });
+
+        egui::Area::new(egui::Id::new("quick_dock_palette_backdrop"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(context, |ui| {
+                let backdrop_rect = ui.ctx().content_rect();
+                ui.painter().rect_filled(
+                    backdrop_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                );
+                if ui
+                    .allocate_rect(backdrop_rect, egui::Sense::click())
+                    .clicked()
+                {
+                    close_now = true;
+                }
+            });
+
+        let mut clicked_index = None;
+        egui::Window::new("검색")
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 44.0))
+            .show(context, |ui| {
+                ui.set_min_width(280.0);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_query)
+                        .hint_text("이름·내용·탭 검색")
+                        .desired_width(f32::INFINITY),
+                );
+                if self.palette_focus_pending {
+                    response.request_focus();
+                    self.palette_focus_pending = false;
+                }
+
+                ui.separator();
+
+                if entries.is_empty() {
+                    ui.label("일치하는 항목이 없습니다.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (index, entry) in entries.iter().enumerate() {
+                                let prefix = if entry.is_recent { "★ " } else { "" };
+                                let label = format!(
+                                    "{prefix}{} · {}",
+                                    format_action_button_label(&entry.item),
+                                    entry.tab_label
+                                );
+                                let response = ui.selectable_label(
+                                    index == self.palette_selected,
+                                    shorten_text(&label, 52),
+                                );
+                                if response.clicked() {
+                                    clicked_index = Some(index);
+                                }
+                            }
+                        });
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("↑↓ 이동 · Enter 실행 · Esc 닫기")
+                        .small()
+                        .weak(),
+                );
+            });
+
+        if let Some(index) = clicked_index {
+            self.palette_selected = index;
+            execute_now = true;
+        }
+
+        if close_now {
+            self.palette_open = false;
+            return;
+        }
+
+        if execute_now {
+            if let Some(entry) = entries.into_iter().nth(self.palette_selected) {
+                self.execute_palette_entry(entry);
+            }
+        }
+    }
+
+    fn execute_palette_entry(&mut self, entry: PaletteEntry) {
+        self.palette_open = false;
+        if let Some(tab_index) = entry.tab_index {
+            self.active_tab_index = tab_index.min(self.tabs.len().saturating_sub(1));
+        }
+        self.record_recent(&entry.item);
+        self.execute_action(&entry.item);
     }
 
     fn show_toast(&mut self, message: impl Into<String>, is_error: bool) {
@@ -1693,6 +2602,7 @@ impl QuickDockApplication {
             Err(message) => {
                 self.last_status_message = format!("실행 실패: {message}");
                 self.show_toast("실행 실패", true);
+                log_event(&format!("실행 실패 [{name}] command='{command}': {message}"));
                 return;
             }
         };
@@ -1710,11 +2620,10 @@ impl QuickDockApplication {
                 self.show_toast("실행했습니다", false);
             }
             Err(error) => {
-                self.last_status_message = format!(
-                    "실행 실패: {}",
-                    describe_spawn_error(&error, &resolved_command)
-                );
+                let detail = describe_spawn_error(&error, &resolved_command);
+                self.last_status_message = format!("실행 실패: {detail}");
                 self.show_toast("실행 실패", true);
+                log_event(&format!("실행 실패 [{name}]: {detail}"));
             }
         }
     }
@@ -1725,6 +2634,7 @@ impl QuickDockApplication {
             Err(message) => {
                 self.last_status_message = format!("열기 실패: {message}");
                 self.show_toast("열기 실패", true);
+                log_event(&format!("열기 실패 [{name}] path='{path}': {message}"));
                 return;
             }
         };
@@ -1744,9 +2654,10 @@ impl QuickDockApplication {
                 self.show_toast("열었습니다", false);
             }
             Err(error) => {
-                self.last_status_message =
-                    format!("열기 실패: {}", describe_spawn_error(&error, path));
+                let detail = describe_spawn_error(&error, path);
+                self.last_status_message = format!("열기 실패: {detail}");
                 self.show_toast("열기 실패", true);
+                log_event(&format!("열기 실패 [{name}]: {detail}"));
             }
         }
     }
@@ -1763,7 +2674,13 @@ impl eframe::App for QuickDockApplication {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        self.ensure_tray_icon();
+        self.poll_tray_events(&context);
         self.update_window_state(&context, frame);
+
+        if context.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Space)) {
+            self.toggle_palette();
+        }
 
         if self.is_dragging {
             let _ = frame;
@@ -1775,6 +2692,8 @@ impl eframe::App for QuickDockApplication {
             self.show_collapsed_user_interface(ui);
         }
 
+        self.show_palette(&context);
+        self.show_pending_input_modal(&context);
         self.show_toast_overlay(&context);
     }
 }
@@ -1904,6 +2823,64 @@ fn clamp_resize_rect(
     rect
 }
 
+fn clamp_free_window_rect(
+    mut rect: egui::Rect,
+    resize_edge: ResizeEdge,
+    monitor_rect: egui::Rect,
+) -> egui::Rect {
+    if rect.width() < MIN_EXPANDED_WIDTH {
+        if resize_edge.affects_left() {
+            rect.min.x = rect.max.x - MIN_EXPANDED_WIDTH;
+        } else {
+            rect.max.x = rect.min.x + MIN_EXPANDED_WIDTH;
+        }
+    }
+    if rect.width() > MAX_EXPANDED_WIDTH {
+        if resize_edge.affects_left() {
+            rect.min.x = rect.max.x - MAX_EXPANDED_WIDTH;
+        } else {
+            rect.max.x = rect.min.x + MAX_EXPANDED_WIDTH;
+        }
+    }
+    if rect.height() < MIN_EXPANDED_HEIGHT {
+        if resize_edge.affects_top() {
+            rect.min.y = rect.max.y - MIN_EXPANDED_HEIGHT;
+        } else {
+            rect.max.y = rect.min.y + MIN_EXPANDED_HEIGHT;
+        }
+    }
+    if rect.height() > MAX_EXPANDED_HEIGHT {
+        if resize_edge.affects_top() {
+            rect.min.y = rect.max.y - MAX_EXPANDED_HEIGHT;
+        } else {
+            rect.max.y = rect.min.y + MAX_EXPANDED_HEIGHT;
+        }
+    }
+
+    if rect.min.x < monitor_rect.min.x {
+        let shift = monitor_rect.min.x - rect.min.x;
+        rect.min.x += shift;
+        rect.max.x += shift;
+    }
+    if rect.max.x > monitor_rect.max.x {
+        let shift = rect.max.x - monitor_rect.max.x;
+        rect.min.x -= shift;
+        rect.max.x -= shift;
+    }
+    if rect.min.y < monitor_rect.min.y {
+        let shift = monitor_rect.min.y - rect.min.y;
+        rect.min.y += shift;
+        rect.max.y += shift;
+    }
+    if rect.max.y > monitor_rect.max.y {
+        let shift = rect.max.y - monitor_rect.max.y;
+        rect.min.y -= shift;
+        rect.max.y -= shift;
+    }
+
+    rect
+}
+
 fn edge_from_monitor_position(
     pointer_position: egui::Pos2,
     monitor_rect: egui::Rect,
@@ -1947,9 +2924,9 @@ fn normal_window_position_for_cursor(
     cursor_position: egui::Pos2,
     pointer_offset: egui::Vec2,
     monitor_rect: egui::Rect,
+    window_size: egui::Vec2,
 ) -> egui::Pos2 {
-    let target_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
-    clamp_window_position(cursor_position - pointer_offset, target_size, monitor_rect)
+    clamp_window_position(cursor_position - pointer_offset, window_size, monitor_rect)
 }
 
 fn clamp_window_position(
@@ -2101,6 +3078,13 @@ fn show_editable_action_item(
                     .font(egui::TextStyle::Monospace)
                     .desired_rows(9)
                     .lock_focus(true),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "변수: {date} {time} {datetime} {clipboard} {selection} {input:라벨}",
+                )
+                .small()
+                .weak(),
             );
 
             if ui.small_button("복사 테스트").clicked() {
@@ -2329,6 +3313,279 @@ fn resolve_open_path_for_spawn(path: &str) -> Result<String, String> {
     ))
 }
 
+#[cfg(target_os = "windows")]
+fn run_application_as_admin(command: &str, arguments: &[String]) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let resolved_command = resolve_application_command_for_spawn(command)?;
+    let parameters = arguments
+        .iter()
+        .map(|argument| expand_environment_variables(argument))
+        .map(|argument| {
+            if argument.contains(char::is_whitespace) {
+                format!("\"{argument}\"")
+            } else {
+                argument
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let verb = wide_null(OsStr::new("runas"));
+    let file = wide_null(OsStr::new(&resolved_command));
+    let parameters_wide = wide_null(OsStr::new(&parameters));
+
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            if parameters.is_empty() {
+                std::ptr::null()
+            } else {
+                parameters_wide.as_ptr()
+            },
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if (result as isize) <= 32 {
+        Err(format!("ShellExecute 코드 {}", result as isize))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_application_as_admin(_command: &str, _arguments: &[String]) -> Result<(), String> {
+    Err("관리자 권한 실행은 Windows에서만 지원합니다.".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn autostart_run_subkey() -> Vec<u16> {
+    use std::ffi::OsStr;
+    wide_null(OsStr::new(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn is_autostart_enabled() -> bool {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+
+    let subkey = autostart_run_subkey();
+    let value_name = wide_null(OsStr::new(AUTOSTART_VALUE_NAME));
+    let mut buffer = [0u16; 1024];
+    let mut size = (buffer.len() * 2) as u32;
+
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+        )
+    };
+
+    status == 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_autostart_enabled() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    let subkey = autostart_run_subkey();
+    let value_name = wide_null(OsStr::new(AUTOSTART_VALUE_NAME));
+
+    let mut key_handle: HKEY = std::ptr::null_mut();
+    let open_status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key_handle,
+            std::ptr::null_mut(),
+        )
+    };
+    if open_status != 0 {
+        return Err(format!("레지스트리 열기 실패 (코드 {open_status})"));
+    }
+
+    let result = if enabled {
+        let executable = env::current_exe().map_err(|error| error.to_string())?;
+        let command = format!("\"{}\"", executable.display());
+        let data = wide_null(OsStr::new(&command));
+        let byte_length = (data.len() * 2) as u32;
+        let status = unsafe {
+            RegSetValueExW(
+                key_handle,
+                value_name.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr() as *const u8,
+                byte_length,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!("등록 실패 (코드 {status})"))
+        }
+    } else {
+        let status = unsafe { RegDeleteValueW(key_handle, value_name.as_ptr()) };
+        if status == 0 || status == 2 {
+            Ok(())
+        } else {
+            Err(format!("해제 실패 (코드 {status})"))
+        }
+    };
+
+    unsafe {
+        RegCloseKey(key_handle);
+    }
+
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_autostart(_enabled: bool) -> Result<(), String> {
+    Err("자동 실행은 Windows에서만 지원합니다.".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn build_tray_state(autostart_enabled: bool) -> Result<TrayState, String> {
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+    use tray_icon::TrayIconBuilder;
+
+    let menu = Menu::new();
+    let open_item = MenuItem::with_id("tray_open", "열기", true, None);
+    let settings_item = MenuItem::with_id("tray_settings", "설정", true, None);
+    let autostart_item = CheckMenuItem::with_id(
+        "tray_autostart",
+        "Windows 시작 시 실행",
+        true,
+        autostart_enabled,
+        None,
+    );
+    let quit_item = MenuItem::with_id("tray_quit", "종료", true, None);
+
+    menu.append(&open_item).map_err(|error| error.to_string())?;
+    menu.append(&settings_item)
+        .map_err(|error| error.to_string())?;
+    menu.append(&autostart_item)
+        .map_err(|error| error.to_string())?;
+    menu.append(&PredefinedMenuItem::separator())
+        .map_err(|error| error.to_string())?;
+    menu.append(&quit_item).map_err(|error| error.to_string())?;
+
+    let icon = build_tray_icon_image()?;
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Quick Dock")
+        .with_icon(icon)
+        .with_menu_on_left_click(false)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    Ok(TrayState {
+        _icon: tray,
+        autostart_item,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn build_tray_icon_image() -> Result<tray_icon::Icon, String> {
+    const SIZE: u32 = 32;
+    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let index = ((y * SIZE + x) * 4) as usize;
+            let is_border = x < 2 || y < 2 || x >= SIZE - 2 || y >= SIZE - 2;
+            let (r, g, b, a) = if is_border {
+                (0, 0, 0, 0)
+            } else {
+                (18, 140, 126, 255)
+            };
+            rgba[index] = r;
+            rgba[index + 1] = g;
+            rgba[index + 2] = b;
+            rgba[index + 3] = a;
+        }
+    }
+
+    for y in 8..24 {
+        for x in 9..12 {
+            let index = ((y * SIZE + x) * 4) as usize;
+            rgba[index] = 235;
+            rgba[index + 1] = 245;
+            rgba[index + 2] = 245;
+            rgba[index + 3] = 255;
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).map_err(|error| error.to_string())
+}
+
+fn reveal_in_file_explorer(path: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let target = Path::new(path);
+        if !target.exists() {
+            return Err(format!("경로가 없습니다: {}", target.display()));
+        }
+
+        Command::new("explorer.exe")
+            .arg(format!("/select,{path}"))
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| describe_spawn_error(&error, path))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let parent = Path::new(path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(path));
+        Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn normalize_command_text(text: &str) -> String {
     let expanded_text = expand_environment_variables(text);
     trim_wrapping_quotes(expanded_text.trim()).trim().to_owned()
@@ -2545,22 +3802,48 @@ fn system_font_candidates() -> &'static [&'static str] {
 }
 
 fn get_configuration_path() -> PathBuf {
+    configuration_directory().join(CONFIGURATION_FILE_NAME)
+}
+
+fn get_log_path() -> PathBuf {
+    configuration_directory().join(LOG_FILE_NAME)
+}
+
+fn configuration_directory() -> PathBuf {
     let executable_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let executable_directory = executable_path.parent().unwrap_or_else(|| Path::new("."));
-    executable_directory
-        .join(CONFIGURATION_DIRECTORY_NAME)
-        .join(CONFIGURATION_FILE_NAME)
+    executable_directory.join(CONFIGURATION_DIRECTORY_NAME)
+}
+
+fn log_event(message: &str) {
+    use std::io::Write;
+
+    let log_path = get_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let (year, month, day, hour, minute, second) = current_local_datetime();
+    let line =
+        format!("[{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}] {message}\n");
+
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 fn load_tabs_from_configuration(
     configuration_path: &Path,
-) -> (Vec<QuickDockTab>, egui::Vec2, String) {
+) -> (Vec<QuickDockTab>, LayoutSettings, String) {
     let was_created = ensure_configuration_file(configuration_path);
 
     match fs::read_to_string(configuration_path) {
         Ok(configuration_text) => {
-            let expanded_size = parse_expanded_size_from_ini(&configuration_text)
-                .unwrap_or_else(default_expanded_size);
+            let layout = parse_layout_from_ini(&configuration_text);
 
             match parse_tabs_from_ini(&configuration_text) {
                 Ok(tabs) => {
@@ -2571,20 +3854,26 @@ fn load_tabs_from_configuration(
                     } else {
                         format!("설정 읽기 완료: {tab_count}개 탭, {item_count}개 항목")
                     };
-                    (tabs, expanded_size, message)
+                    (tabs, layout, message)
                 }
-                Err(error) => (
-                    vec![QuickDockTab::new("기본".to_owned(), get_default_items())],
-                    expanded_size,
-                    format!("설정 파싱 실패. 기본 항목 사용: {error}"),
-                ),
+                Err(error) => {
+                    log_event(&format!("설정 파싱 실패: {error}"));
+                    (
+                        vec![QuickDockTab::new("기본".to_owned(), get_default_items())],
+                        layout,
+                        format!("설정 파싱 실패. 기본 항목 사용: {error}"),
+                    )
+                }
             }
         }
-        Err(error) => (
-            vec![QuickDockTab::new("기본".to_owned(), get_default_items())],
-            default_expanded_size(),
-            format!("설정 파일 읽기 실패. 기본 항목 사용: {error}"),
-        ),
+        Err(error) => {
+            log_event(&format!("설정 파일 읽기 실패: {error}"));
+            (
+                vec![QuickDockTab::new("기본".to_owned(), get_default_items())],
+                LayoutSettings::default(),
+                format!("설정 파일 읽기 실패. 기본 항목 사용: {error}"),
+            )
+        }
     }
 }
 
@@ -2603,18 +3892,18 @@ fn ensure_configuration_file(configuration_path: &Path) -> bool {
 fn save_tabs_to_configuration(
     configuration_path: &Path,
     tabs: &[QuickDockTab],
-    expanded_size: egui::Vec2,
+    layout: &LayoutSettings,
+    backup: bool,
 ) -> std::io::Result<()> {
     if let Some(parent) = configuration_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    backup_configuration_file(configuration_path)?;
+    if backup {
+        backup_configuration_file(configuration_path)?;
+    }
 
-    fs::write(
-        configuration_path,
-        serialize_tabs_to_ini(tabs, expanded_size),
-    )
+    fs::write(configuration_path, serialize_tabs_to_ini(tabs, layout))
 }
 
 fn backup_configuration_file(configuration_path: &Path) -> std::io::Result<()> {
@@ -2633,16 +3922,29 @@ fn backup_configuration_file(configuration_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn serialize_tabs_to_ini(tabs: &[QuickDockTab], expanded_size: egui::Vec2) -> String {
-    let expanded_size = clamp_expanded_size(expanded_size);
+fn serialize_tabs_to_ini(tabs: &[QuickDockTab], layout: &LayoutSettings) -> String {
+    let expanded_size = clamp_expanded_size(layout.expanded_size);
+    let window_size = clamp_expanded_size(layout.window_size);
     let mut output = String::from(
         "; Quick Dock 설정 파일\n; 앱 안의 설정 화면에서 편집할 수 있습니다.\n; 실행 인자는 | 로 구분합니다.\n\n",
     );
 
     output.push_str("[layout]\n");
-    output.push_str("schema_version=1\n");
+    output.push_str(&format!("schema_version={SCHEMA_VERSION}\n"));
     output.push_str(&format!("expanded_width={:.0}\n", expanded_size.x));
-    output.push_str(&format!("expanded_height={:.0}\n\n", expanded_size.y));
+    output.push_str(&format!("expanded_height={:.0}\n", expanded_size.y));
+    output.push_str(&format!("window_width={:.0}\n", window_size.x));
+    output.push_str(&format!("window_height={:.0}\n", window_size.y));
+    output.push_str(&format!("dock_edge={}\n\n", layout.dock_edge.ini_value()));
+
+    for (monitor_key, state) in layout.monitors.iter() {
+        output.push_str(&format!("[monitor.{}]\n", escape_ini_value(monitor_key)));
+        output.push_str(&format!("edge={}\n", state.edge.ini_value()));
+        output.push_str(&format!("anchor_x={:.0}\n", state.anchor.x));
+        output.push_str(&format!("anchor_y={:.0}\n", state.anchor.y));
+        output.push_str(&format!("expanded_width={:.0}\n", state.expanded_size.x));
+        output.push_str(&format!("expanded_height={:.0}\n\n", state.expanded_size.y));
+    }
 
     for (tab_index, tab) in tabs.iter().enumerate() {
         output.push_str(&format!("[tab.{}]\n", tab_index + 1));
@@ -2693,20 +3995,87 @@ fn escape_ini_value(value: &str) -> String {
         .replace('\t', "\\t")
 }
 
-fn parse_expanded_size_from_ini(configuration_text: &str) -> Option<egui::Vec2> {
-    let sections = parse_ini_sections(configuration_text).ok()?;
-    let (_, properties) = sections
+fn parse_layout_from_ini(configuration_text: &str) -> LayoutSettings {
+    let Ok(sections) = parse_ini_sections(configuration_text) else {
+        return LayoutSettings::default();
+    };
+
+    let mut layout = LayoutSettings::default();
+
+    if let Some((_, properties)) = sections
         .iter()
-        .find(|(section_name, _)| section_name.eq_ignore_ascii_case("layout"))?;
+        .find(|(section_name, _)| section_name.eq_ignore_ascii_case("layout"))
+    {
+        if let Some(width) = parse_f32_value(properties, "expanded_width") {
+            layout.expanded_size.x = width;
+        }
+        if let Some(height) = parse_f32_value(properties, "expanded_height") {
+            layout.expanded_size.y = height;
+        }
+        layout.expanded_size = clamp_expanded_size(layout.expanded_size);
 
-    let width = optional_ini_value(properties, "expanded_width")
-        .and_then(|value| value.parse::<f32>().ok())
-        .unwrap_or(EXPANDED_WIDTH);
-    let height = optional_ini_value(properties, "expanded_height")
-        .and_then(|value| value.parse::<f32>().ok())
-        .unwrap_or(EXPANDED_HEIGHT);
+        if let Some(width) = parse_f32_value(properties, "window_width") {
+            layout.window_size.x = width;
+        }
+        if let Some(height) = parse_f32_value(properties, "window_height") {
+            layout.window_size.y = height;
+        }
+        layout.window_size = clamp_expanded_size(layout.window_size);
 
-    Some(clamp_expanded_size(egui::vec2(width, height)))
+        if let Some(edge) =
+            optional_ini_value(properties, "dock_edge").and_then(|value| DockEdge::from_ini_value(&value))
+        {
+            layout.dock_edge = edge;
+        }
+    }
+
+    for (section_name, properties) in sections.iter() {
+        if section_name.len() <= 8 || !section_name[..8].eq_ignore_ascii_case("monitor.") {
+            continue;
+        }
+
+        let monitor_key = section_name[8..].to_owned();
+        if monitor_key.is_empty() {
+            continue;
+        }
+
+        let edge = optional_ini_value(properties, "edge")
+            .and_then(|value| DockEdge::from_ini_value(&value))
+            .unwrap_or(layout.dock_edge);
+        let anchor = egui::pos2(
+            parse_f32_value(properties, "anchor_x").unwrap_or(0.0),
+            parse_f32_value(properties, "anchor_y").unwrap_or(0.0),
+        );
+        let expanded_size = clamp_expanded_size(egui::vec2(
+            parse_f32_value(properties, "expanded_width").unwrap_or(layout.expanded_size.x),
+            parse_f32_value(properties, "expanded_height").unwrap_or(layout.expanded_size.y),
+        ));
+
+        layout.monitors.insert(
+            monitor_key,
+            MonitorDockState {
+                edge,
+                anchor,
+                expanded_size,
+            },
+        );
+    }
+
+    layout
+}
+
+fn parse_f32_value(properties: &BTreeMap<String, String>, key: &str) -> Option<f32> {
+    optional_ini_value(properties, key).and_then(|value| value.parse::<f32>().ok())
+}
+
+fn monitor_key(rect: egui::Rect) -> String {
+    format!(
+        "{}x{}+{}+{}",
+        rect.width().round() as i32,
+        rect.height().round() as i32,
+        rect.min.x.round() as i32,
+        rect.min.y.round() as i32,
+    )
 }
 
 fn parse_tabs_from_ini(configuration_text: &str) -> Result<Vec<QuickDockTab>, String> {
@@ -2964,12 +4333,17 @@ name=Jira - 조치 기록
 text=조치 내용:\n- \n\n원인:\n- \n\n변경 사항:\n- \n\n확인 결과:\n- 정상 확인\n
 
 [tab.1.item.4]
+kind=copy_text
+name=작업 완료 (티켓 입력)
+text=작업 완료했습니다. 티켓: {input:티켓 번호} ({datetime})
+
+[tab.1.item.5]
 kind=run_app
 name=메모장 실행
 command=notepad.exe
 arguments=
 
-[tab.1.item.5]
+[tab.1.item.6]
 kind=open_path
 name=다운로드 폴더 열기
 path=C:\Users\%USERNAME%\Downloads
@@ -3102,6 +4476,238 @@ fn known_windows_application_folder_names(command_stem: &str) -> Vec<String> {
     }
 
     folder_names
+}
+
+fn extract_input_labels(template: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut rest = template;
+
+    while let Some(open_index) = rest.find('{') {
+        let after_open = &rest[open_index + 1..];
+        let Some(close_index) = after_open.find('}') else {
+            break;
+        };
+
+        let token = &after_open[..close_index];
+        if let Some(label) = token.strip_prefix("input:") {
+            let label = label.trim().to_owned();
+            if !label.is_empty() && !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+
+        rest = &after_open[close_index + 1..];
+    }
+
+    labels
+}
+
+fn expand_copy_template(
+    template: &str,
+    inputs: &[TemplateInputField],
+    selection_text: &str,
+) -> String {
+    let clipboard_text = if template.contains("{clipboard}") {
+        read_clipboard_text().unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let (year, month, day, hour, minute, second) = current_local_datetime();
+    let date_text = format!("{year:04}-{month:02}-{day:02}");
+    let time_text = format!("{hour:02}:{minute:02}:{second:02}");
+    let datetime_text = format!("{date_text} {time_text}");
+
+    let mut result = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(open_index) = rest.find('{') {
+        result.push_str(&rest[..open_index]);
+        let after_open = &rest[open_index + 1..];
+
+        let Some(close_index) = after_open.find('}') else {
+            result.push('{');
+            rest = after_open;
+            continue;
+        };
+
+        let token = &after_open[..close_index];
+        let replacement = match token {
+            "date" => Some(date_text.clone()),
+            "time" => Some(time_text.clone()),
+            "datetime" => Some(datetime_text.clone()),
+            "clipboard" => Some(clipboard_text.clone()),
+            "selection" => Some(selection_text.to_owned()),
+            other => other.strip_prefix("input:").map(|label| {
+                let label = label.trim();
+                inputs
+                    .iter()
+                    .find(|field| field.label == label)
+                    .map(|field| field.value.clone())
+                    .unwrap_or_default()
+            }),
+        };
+
+        match replacement {
+            Some(value) => result.push_str(&value),
+            None => {
+                result.push('{');
+                result.push_str(token);
+                result.push('}');
+            }
+        }
+
+        rest = &after_open[close_index + 1..];
+    }
+
+    result.push_str(rest);
+    result
+}
+
+fn read_clipboard_text() -> Option<String> {
+    Clipboard::new().ok()?.get_text().ok()
+}
+
+fn current_local_datetime() -> (i32, u32, u32, u32, u32, u32) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+
+        let mut system_time: windows_sys::Win32::Foundation::SYSTEMTIME =
+            unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut system_time) };
+
+        return (
+            system_time.wYear as i32,
+            system_time.wMonth as u32,
+            system_time.wDay as u32,
+            system_time.wHour as u32,
+            system_time.wMinute as u32,
+            system_time.wSecond as u32,
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let total_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        civil_datetime_from_unix(total_seconds)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn civil_datetime_from_unix(total_seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let hour = (seconds_of_day / 3600) as u32;
+    let minute = ((seconds_of_day % 3600) / 60) as u32;
+    let second = (seconds_of_day % 60) as u32;
+
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
+    let month = (if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    }) as u32;
+    let year = (year + if month <= 2 { 1 } else { 0 }) as i32;
+
+    (year, month, day, hour, minute, second)
+}
+
+fn current_external_foreground_window() -> Option<isize> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
+
+        unsafe {
+            let handle = GetForegroundWindow();
+            if handle.is_null() {
+                return None;
+            }
+
+            let mut buffer = [0u16; 256];
+            let length = GetWindowTextW(handle, buffer.as_mut_ptr(), buffer.len() as i32);
+            if length > 0 {
+                let title = String::from_utf16_lossy(&buffer[..length as usize]);
+                if title == "Quick Dock" {
+                    return None;
+                }
+            }
+
+            Some(handle as isize)
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+fn capture_selection_text(previous_window: Option<isize>) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+
+        let handle = previous_window? as *mut core::ffi::c_void;
+        unsafe {
+            SetForegroundWindow(handle);
+            send_copy_command();
+        }
+        std::thread::sleep(Duration::from_millis(140));
+        read_clipboard_text().filter(|text| !text.is_empty())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = previous_window;
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn send_copy_command() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+    };
+
+    const VK_C: u16 = 0x43;
+
+    fn key_event(virtual_key: u16, key_up: bool) -> INPUT {
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.r#type = INPUT_KEYBOARD;
+        input.Anonymous.ki = KEYBDINPUT {
+            wVk: virtual_key,
+            wScan: 0,
+            dwFlags: if key_up { KEYEVENTF_KEYUP } else { 0 },
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        input
+    }
+
+    let inputs = [
+        key_event(VK_CONTROL, false),
+        key_event(VK_C, false),
+        key_event(VK_C, true),
+        key_event(VK_CONTROL, true),
+    ];
+
+    SendInput(
+        inputs.len() as u32,
+        inputs.as_ptr(),
+        std::mem::size_of::<INPUT>() as i32,
+    );
 }
 
 fn expand_environment_variables(text: &str) -> String {
