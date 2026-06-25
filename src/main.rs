@@ -540,7 +540,6 @@ struct PaletteEntry {
     item: ActionItem,
     tab_index: Option<usize>,
     tab_label: String,
-    is_recent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1866,44 +1865,63 @@ impl QuickDockApplication {
                     self.begin_title_bar_drag(ui.ctx());
                 }
 
-                let close_response = ui.add_sized(
-                    close_size,
-                    egui::Button::new(egui::RichText::new("X").strong().size(14.0))
-                        .fill(egui::Color32::TRANSPARENT),
-                );
+                let close_tooltip = if self.is_settings_editor_open {
+                    "저장하고 닫기"
+                } else {
+                    "닫기"
+                };
+                let close_response = ui
+                    .add_sized(
+                        close_size,
+                        egui::Button::new(egui::RichText::new("X").strong().size(14.0))
+                            .fill(egui::Color32::TRANSPARENT),
+                    )
+                    .on_hover_text(close_tooltip);
 
                 if close_response.clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.handle_close_button(ui.ctx());
                 }
             });
 
-            ui.horizontal_wrapped(|ui| {
-                if ui.small_button("검색").clicked() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(3.0, 0.0);
+
+                if toolbar_icon_button(ui, "검색 (Ctrl+Space)", self.palette_open, draw_search_icon)
+                    .clicked()
+                {
                     self.toggle_palette();
                 }
 
-                if ui.small_button("새 탭").clicked() {
+                if toolbar_icon_button(ui, "새 탭", false, draw_plus_icon).clicked() {
                     self.add_tab();
                 }
 
-                if ui.small_button("다시 읽기").clicked() {
+                if toolbar_icon_button(ui, "다시 읽기", false, draw_refresh_icon).clicked() {
                     self.reload_configuration();
                 }
 
-                if ui.small_button("탐색기 정리").clicked() {
+                if toolbar_icon_button(ui, "탐색기 정리", false, draw_tidy_icon).clicked() {
                     self.close_related_explorer_windows();
                 }
 
-                let autostart_label = if self.autostart_enabled {
-                    "자동시작 ✓"
+                let autostart_tooltip = if self.autostart_enabled {
+                    "자동 실행: 켜짐 (클릭하여 끄기)"
                 } else {
-                    "자동시작"
+                    "자동 실행: 꺼짐 (클릭하여 켜기)"
                 };
-                if ui.small_button(autostart_label).clicked() {
+                if toolbar_icon_button(ui, autostart_tooltip, self.autostart_enabled, draw_power_icon)
+                    .clicked()
+                {
                     self.toggle_autostart();
                 }
 
-                if ui.small_button("설정").clicked() {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                if toolbar_icon_button(ui, "설정", self.is_settings_editor_open, draw_gear_icon)
+                    .clicked()
+                {
                     if self.is_settings_editor_open {
                         self.cancel_settings_editor();
                     } else {
@@ -1912,6 +1930,20 @@ impl QuickDockApplication {
                 }
             });
         });
+    }
+
+    fn handle_close_button(&mut self, context: &egui::Context) {
+        if self.is_settings_editor_open {
+            // 설정 편집 중 X = 저장하고 닫기 (검증 실패 시 편집 화면 유지)
+            self.save_settings_editor();
+        } else if self.palette_open {
+            self.palette_open = false;
+        } else if self.pending_input_copy.is_some() {
+            self.pending_input_copy = None;
+            self.last_status_message = "복사를 취소했습니다.".to_owned();
+        } else {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn show_tab_strip(&mut self, ui: &mut egui::Ui) {
@@ -1996,7 +2028,17 @@ impl QuickDockApplication {
 
     fn show_settings_editor(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("저장").clicked() {
+            let save_button = egui::Button::new(
+                egui::RichText::new("저장")
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            )
+            .fill(egui::Color32::from_rgb(46, 150, 95));
+            if ui
+                .add(save_button)
+                .on_hover_text("저장하고 닫기 (제목줄 X도 동일)")
+                .clicked()
+            {
                 self.save_settings_editor();
             }
 
@@ -2387,7 +2429,6 @@ impl QuickDockApplication {
                     item: item.clone(),
                     tab_index: None,
                     tab_label: "최근".to_owned(),
-                    is_recent: true,
                 });
             }
             for (tab_index, tab) in self.tabs.iter().enumerate() {
@@ -2396,7 +2437,6 @@ impl QuickDockApplication {
                         item: item.clone(),
                         tab_index: Some(tab_index),
                         tab_label: tab.name.clone(),
-                        is_recent: false,
                     });
                 }
             }
@@ -2410,7 +2450,6 @@ impl QuickDockApplication {
                             item: item.clone(),
                             tab_index: Some(tab_index),
                             tab_label: tab.name.clone(),
-                            is_recent: false,
                         });
                     }
                 }
@@ -2499,9 +2538,8 @@ impl QuickDockApplication {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for (index, entry) in entries.iter().enumerate() {
-                                let prefix = if entry.is_recent { "★ " } else { "" };
                                 let label = format!(
-                                    "{prefix}{} · {}",
+                                    "{} · {}",
                                     format_action_button_label(&entry.item),
                                     entry.tab_label
                                 );
@@ -2518,7 +2556,7 @@ impl QuickDockApplication {
 
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("↑↓ 이동 · Enter 실행 · Esc 닫기")
+                    egui::RichText::new("위/아래 이동 · Enter 실행 · Esc 닫기")
                         .small()
                         .weak(),
                 );
@@ -3026,6 +3064,151 @@ fn format_action_button_label(item: &ActionItem) -> String {
         ActionItem::CopyText { .. } => format!("복사 · {name}"),
         ActionItem::RunApplication { .. } => format!("실행 · {name}"),
         ActionItem::OpenPath { .. } => format!("열기 · {name}"),
+    }
+}
+
+fn toolbar_icon_button(
+    ui: &mut egui::Ui,
+    tooltip: &str,
+    active: bool,
+    draw: fn(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(32.0, 28.0), egui::Sense::click());
+
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(72, 160, 148));
+    } else if response.hovered() {
+        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(222, 233, 238));
+    }
+
+    let icon_color = if active {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(40, 60, 72)
+    };
+    draw(painter, rect.shrink(6.0), icon_color);
+
+    if response.hovered() {
+        ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+    }
+
+    response.on_hover_text(tooltip)
+}
+
+fn arc_point(center: egui::Pos2, radius: f32, degrees: f32) -> egui::Pos2 {
+    let radians = degrees.to_radians();
+    egui::pos2(
+        center.x + radius * radians.cos(),
+        center.y + radius * radians.sin(),
+    )
+}
+
+fn arc_points(
+    center: egui::Pos2,
+    radius: f32,
+    start_degrees: f32,
+    end_degrees: f32,
+    segments: usize,
+) -> Vec<egui::Pos2> {
+    (0..=segments)
+        .map(|index| {
+            let fraction = index as f32 / segments as f32;
+            let degrees = start_degrees + (end_degrees - start_degrees) * fraction;
+            arc_point(center, radius, degrees)
+        })
+        .collect()
+}
+
+fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.8, color);
+    let radius = rect.width().min(rect.height()) * 0.32;
+    let center = rect.min + egui::vec2(rect.width() * 0.40, rect.height() * 0.40);
+    painter.circle_stroke(center, radius, stroke);
+    let handle_start = center + egui::vec2(radius * 0.7, radius * 0.7);
+    let handle_end = rect.max - egui::vec2(rect.width() * 0.06, rect.height() * 0.06);
+    painter.line_segment([handle_start, handle_end], egui::Stroke::new(2.2, color));
+}
+
+fn draw_plus_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(2.2, color);
+    let center = rect.center();
+    let arm = rect.width().min(rect.height()) * 0.42;
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y - arm),
+            egui::pos2(center.x, center.y + arm),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x - arm, center.y),
+            egui::pos2(center.x + arm, center.y),
+        ],
+        stroke,
+    );
+}
+
+fn draw_refresh_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.9, color);
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.40;
+    painter.add(egui::Shape::line(
+        arc_points(center, radius, -50.0, 210.0, 24),
+        stroke,
+    ));
+
+    // 화살촉: 호의 끝(210°)에서 안/밖으로 짧은 선
+    let tip = arc_point(center, radius, 210.0);
+    painter.line_segment([tip, arc_point(center, radius * 0.70, 196.0)], stroke);
+    painter.line_segment([tip, arc_point(center, radius * 1.30, 196.0)], stroke);
+}
+
+fn draw_tidy_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.7, color);
+    let size = egui::vec2(rect.width() * 0.56, rect.height() * 0.56);
+    let back = egui::Rect::from_min_size(rect.min + egui::vec2(rect.width() * 0.30, 0.0), size);
+    let front = egui::Rect::from_min_size(rect.min + egui::vec2(0.0, rect.height() * 0.30), size);
+    painter.rect_stroke(back, 2.0, stroke, egui::StrokeKind::Inside);
+    painter.rect_filled(front, 2.0, egui::Color32::from_rgb(242, 246, 248));
+    painter.rect_stroke(front, 2.0, stroke, egui::StrokeKind::Inside);
+}
+
+fn draw_power_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.9, color);
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.36;
+    // 윗부분이 열린 원 (전원 기호)
+    painter.add(egui::Shape::line(
+        arc_points(center, radius, -60.0, 240.0, 22),
+        stroke,
+    ));
+    painter.line_segment(
+        [
+            egui::pos2(center.x, rect.top()),
+            egui::pos2(center.x, center.y - radius * 0.1),
+        ],
+        stroke,
+    );
+}
+
+fn draw_gear_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.7, color);
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.30;
+    painter.circle_stroke(center, radius, stroke);
+    painter.circle_stroke(center, radius * 0.42, stroke);
+    for tooth in 0..6 {
+        let degrees = tooth as f32 * 60.0;
+        painter.line_segment(
+            [
+                arc_point(center, radius, degrees),
+                arc_point(center, radius * 1.5, degrees),
+            ],
+            egui::Stroke::new(2.0, color),
+        );
     }
 }
 
