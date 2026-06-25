@@ -1,0 +1,59 @@
+# quick_dock.toml
+# exe 파일과 같은 폴더에 두면 앱 시작 시 읽습니다.
+
+[[items]]
+kind = "copy_text"
+name = "Jira - 검토 완료"
+text = """
+검토 완료했습니다.
+
+확인 내용:
+- 
+
+조치 사항:
+- 없음
+
+특이 사항:
+- 없음
+"""
+
+[[items]]
+kind = "copy_text"
+name = "Jira - 상세 설명 요청"
+text = """
+자세히 설명해 주세요.
+
+확인이 필요한 내용:
+- 재현 절차:
+- 기대 결과:
+- 실제 결과:
+- 관련 로그 또는 화면:
+"""
+
+[[items]]
+kind = "copy_text"
+name = "Jira - 조치 기록"
+text = """
+조치 내용:
+- 
+
+원인:
+- 
+
+변경 사항:
+- 
+
+확인 결과:
+- 정상 확인
+"""
+
+[[items]]
+kind = "run_app"
+name = "메모장 실행"
+command = "notepad.exe"
+arguments = []
+
+[[items]]
+kind = "open_path"
+name = "다운로드 폴더 열기"
+path = "C:\\Users\\%USERNAME%\\Downloads"

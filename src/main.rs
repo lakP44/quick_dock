@@ -1,0 +1,2712 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arboard::Clipboard;
+use eframe::egui;
+
+const NORMAL_WINDOW_WIDTH: f32 = 440.0;
+const NORMAL_WINDOW_HEIGHT: f32 = 520.0;
+const COLLAPSED_THICKNESS: f32 = 22.0;
+const COLLAPSED_LENGTH: f32 = 96.0;
+const EXPANDED_WIDTH: f32 = 350.0;
+const EXPANDED_HEIGHT: f32 = 430.0;
+const MIN_EXPANDED_WIDTH: f32 = 260.0;
+const MIN_EXPANDED_HEIGHT: f32 = 260.0;
+const MAX_EXPANDED_WIDTH: f32 = 900.0;
+const MAX_EXPANDED_HEIGHT: f32 = 900.0;
+const TITLE_BAR_HEIGHT: f32 = 32.0;
+const INITIAL_Y: f32 = 260.0;
+const COLLAPSE_DELAY_MILLISECONDS: u64 = 1000;
+const RESIZE_HANDLE_THICKNESS: f32 = 12.0;
+const TOAST_DURATION_MILLISECONDS: u64 = 1800;
+const SCREEN_EDGE_DROP_DISTANCE: f32 = 96.0;
+const CONFIGURATION_DIRECTORY_NAME: &str = "env";
+const CONFIGURATION_FILE_NAME: &str = "quick_dock.ini";
+
+fn main() -> eframe::Result {
+    let Some(_single_instance_guard) = SingleInstanceGuard::acquire() else {
+        return Ok(());
+    };
+
+    let initial_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Quick Dock")
+            .with_inner_size(initial_size)
+            .with_min_inner_size(egui::vec2(360.0, 360.0))
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_taskbar(true),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Quick Dock",
+        native_options,
+        Box::new(|creation_context| Ok(Box::new(QuickDockApplication::new(creation_context)))),
+    )
+}
+
+#[cfg(target_os = "windows")]
+struct SingleInstanceGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl SingleInstanceGuard {
+    fn acquire() -> Option<Self> {
+        use std::ffi::OsStr;
+        use std::ptr::null;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
+        };
+
+        let mutex_name = wide_null(OsStr::new("Local\\QuickDockSingleInstance"));
+        let handle = unsafe { CreateMutexW(null(), 1, mutex_name.as_ptr()) };
+
+        if handle.is_null() {
+            return Some(Self { handle });
+        }
+
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            let message = wide_null(OsStr::new("Quick Dock가 이미 실행 중입니다."));
+            let title = wide_null(OsStr::new("Quick Dock"));
+            unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    message.as_ptr(),
+                    title.as_ptr(),
+                    MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+                );
+                CloseHandle(handle);
+            }
+            return None;
+        }
+
+        Some(Self { handle })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null(text: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    text.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+struct SingleInstanceGuard;
+
+#[cfg(not(target_os = "windows"))]
+impl SingleInstanceGuard {
+    fn acquire() -> Option<Self> {
+        Some(Self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DockEdge {
+    fn korean_name(self) -> &'static str {
+        match self {
+            DockEdge::Left => "왼쪽",
+            DockEdge::Right => "오른쪽",
+            DockEdge::Top => "위쪽",
+            DockEdge::Bottom => "아래쪽",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ActionItem {
+    CopyText {
+        name: String,
+        text: String,
+    },
+    RunApplication {
+        name: String,
+        command: String,
+        arguments: Vec<String>,
+    },
+    OpenPath {
+        name: String,
+        path: String,
+    },
+}
+
+impl ActionItem {
+    fn name(&self) -> &str {
+        match self {
+            ActionItem::CopyText { name, .. } => name,
+            ActionItem::RunApplication { name, .. } => name,
+            ActionItem::OpenPath { name, .. } => name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionKind {
+    CopyText,
+    RunApplication,
+    OpenPath,
+}
+
+impl ActionKind {
+    fn label(self) -> &'static str {
+        match self {
+            ActionKind::CopyText => "복사",
+            ActionKind::RunApplication => "실행",
+            ActionKind::OpenPath => "열기",
+        }
+    }
+
+    fn ini_value(self) -> &'static str {
+        match self {
+            ActionKind::CopyText => "copy_text",
+            ActionKind::RunApplication => "run_app",
+            ActionKind::OpenPath => "open_path",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EditableActionItem {
+    kind: ActionKind,
+    name: String,
+    text: String,
+    command: String,
+    arguments: String,
+    path: String,
+}
+
+impl EditableActionItem {
+    fn blank(kind: ActionKind) -> Self {
+        Self {
+            kind,
+            name: "새 항목".to_owned(),
+            text: String::new(),
+            command: String::new(),
+            arguments: String::new(),
+            path: String::new(),
+        }
+    }
+
+    fn from_action_item(item: &ActionItem) -> Self {
+        match item {
+            ActionItem::CopyText { name, text } => Self {
+                kind: ActionKind::CopyText,
+                name: name.clone(),
+                text: text.clone(),
+                command: String::new(),
+                arguments: String::new(),
+                path: String::new(),
+            },
+            ActionItem::RunApplication {
+                name,
+                command,
+                arguments,
+            } => Self {
+                kind: ActionKind::RunApplication,
+                name: name.clone(),
+                text: String::new(),
+                command: command.clone(),
+                arguments: arguments.join("|"),
+                path: String::new(),
+            },
+            ActionItem::OpenPath { name, path } => Self {
+                kind: ActionKind::OpenPath,
+                name: name.clone(),
+                text: String::new(),
+                command: String::new(),
+                arguments: String::new(),
+                path: path.clone(),
+            },
+        }
+    }
+
+    fn to_action_item(&self) -> ActionItem {
+        match self.kind {
+            ActionKind::CopyText => ActionItem::CopyText {
+                name: self.name.clone(),
+                text: self.text.clone(),
+            },
+            ActionKind::RunApplication => ActionItem::RunApplication {
+                name: self.name.clone(),
+                command: self.command.clone(),
+                arguments: parse_argument_list(&self.arguments),
+            },
+            ActionKind::OpenPath => ActionItem::OpenPath {
+                name: self.name.clone(),
+                path: self.path.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QuickDockTab {
+    name: String,
+    items: Vec<ActionItem>,
+    editable_items: Vec<EditableActionItem>,
+}
+
+impl QuickDockTab {
+    fn new(name: String, items: Vec<ActionItem>) -> Self {
+        let editable_items = items
+            .iter()
+            .map(EditableActionItem::from_action_item)
+            .collect();
+
+        Self {
+            name,
+            items,
+            editable_items,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DragDropTarget {
+    Window {
+        monitor_rect: egui::Rect,
+    },
+    Dock {
+        edge: DockEdge,
+        monitor_rect: egui::Rect,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeEdge {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ResizeEdge {
+    fn cursor_icon(self) -> egui::CursorIcon {
+        match self {
+            ResizeEdge::TopLeft => egui::CursorIcon::ResizeNorthWest,
+            ResizeEdge::TopRight => egui::CursorIcon::ResizeNorthEast,
+            ResizeEdge::BottomLeft => egui::CursorIcon::ResizeSouthWest,
+            ResizeEdge::BottomRight => egui::CursorIcon::ResizeSouthEast,
+        }
+    }
+
+    fn affects_left(self) -> bool {
+        matches!(self, ResizeEdge::TopLeft | ResizeEdge::BottomLeft)
+    }
+
+    fn affects_right(self) -> bool {
+        matches!(self, ResizeEdge::TopRight | ResizeEdge::BottomRight)
+    }
+
+    fn affects_top(self) -> bool {
+        matches!(self, ResizeEdge::TopLeft | ResizeEdge::TopRight)
+    }
+
+    fn affects_bottom(self) -> bool {
+        matches!(self, ResizeEdge::BottomLeft | ResizeEdge::BottomRight)
+    }
+
+    fn id_salt(self) -> &'static str {
+        match self {
+            ResizeEdge::TopLeft => "top_left",
+            ResizeEdge::TopRight => "top_right",
+            ResizeEdge::BottomLeft => "bottom_left",
+            ResizeEdge::BottomRight => "bottom_right",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResizeDrag {
+    edge: ResizeEdge,
+    start_window_rect: egui::Rect,
+}
+
+struct QuickDockApplication {
+    configuration_path: PathBuf,
+    tabs: Vec<QuickDockTab>,
+    active_tab_index: usize,
+    next_tab_number: usize,
+    new_item_kind: ActionKind,
+    dock_edge: DockEdge,
+    highlighted_dock_edge: Option<DockEdge>,
+    drag_drop_target: Option<DragDropTarget>,
+    drag_pointer_offset: egui::Vec2,
+    expanded_resize_drag: Option<ResizeDrag>,
+    expanded_size: egui::Vec2,
+    renaming_tab_index: Option<usize>,
+    renaming_focus_pending: bool,
+    is_settings_editor_open: bool,
+    is_docked: bool,
+    is_expanded: bool,
+    is_dragging: bool,
+    last_hovered_at: Instant,
+    last_status_message: String,
+    toast_message: Option<String>,
+    toast_started_at: Instant,
+    toast_is_error: bool,
+    last_known_position: egui::Pos2,
+    last_known_inner_position: egui::Pos2,
+    last_known_monitor_rect: egui::Rect,
+    available_monitor_rects: Vec<egui::Rect>,
+    dock_anchor_position: egui::Pos2,
+}
+
+impl QuickDockApplication {
+    fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+        configure_system_fonts(&creation_context.egui_ctx);
+
+        let configuration_path = get_configuration_path();
+        let (tabs, expanded_size, status_message) =
+            load_tabs_from_configuration(&configuration_path);
+        let next_tab_number = tabs.len() + 1;
+
+        Self {
+            configuration_path,
+            tabs,
+            active_tab_index: 0,
+            next_tab_number,
+            new_item_kind: ActionKind::CopyText,
+            dock_edge: DockEdge::Left,
+            highlighted_dock_edge: None,
+            drag_drop_target: None,
+            drag_pointer_offset: egui::vec2(24.0, 16.0),
+            expanded_resize_drag: None,
+            expanded_size,
+            renaming_tab_index: None,
+            renaming_focus_pending: false,
+            is_settings_editor_open: false,
+            is_docked: false,
+            is_expanded: true,
+            is_dragging: false,
+            last_hovered_at: Instant::now(),
+            last_status_message: status_message,
+            toast_message: None,
+            toast_started_at: Instant::now(),
+            toast_is_error: false,
+            last_known_position: egui::pos2(0.0, INITIAL_Y),
+            last_known_inner_position: egui::pos2(0.0, INITIAL_Y),
+            last_known_monitor_rect: egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1920.0, 1080.0),
+            ),
+            available_monitor_rects: vec![egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1920.0, 1080.0),
+            )],
+            dock_anchor_position: egui::pos2(0.0, INITIAL_Y + COLLAPSED_LENGTH * 0.5),
+        }
+    }
+
+    fn reload_configuration(&mut self) {
+        let (tabs, expanded_size, status_message) =
+            load_tabs_from_configuration(&self.configuration_path);
+        self.tabs = tabs;
+        self.expanded_size = expanded_size;
+        self.active_tab_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+        self.next_tab_number = self.tabs.len() + 1;
+        self.renaming_tab_index = None;
+        self.renaming_focus_pending = false;
+        self.last_status_message = status_message;
+    }
+
+    fn update_window_state(&mut self, context: &egui::Context, frame: &eframe::Frame) {
+        let viewport_info = context.input(|input| input.viewport().clone());
+
+        self.update_monitor_rect(context, frame, &viewport_info);
+
+        if let Some(outer_rect) = viewport_info.outer_rect {
+            self.last_known_position = outer_rect.min;
+        }
+
+        if let Some(inner_rect) = viewport_info.inner_rect {
+            self.last_known_inner_position = inner_rect.min;
+        }
+
+        if self.is_dragging {
+            self.update_drag_preview(context);
+            context.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+
+        if self.expanded_resize_drag.is_some() {
+            self.update_expanded_resize(context);
+            context.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+
+        if !self.is_docked {
+            context.request_repaint_after(Duration::from_millis(80));
+            return;
+        }
+
+        if self.is_settings_editor_open {
+            self.last_hovered_at = Instant::now();
+            if !self.is_expanded {
+                self.is_expanded = true;
+                self.apply_dock_geometry(context);
+            }
+            context.request_repaint_after(Duration::from_millis(80));
+            return;
+        }
+
+        let is_pointer_inside_window = context.input(|input| input.pointer.hover_pos().is_some());
+
+        if is_pointer_inside_window {
+            self.last_hovered_at = Instant::now();
+        }
+
+        let should_expand = is_pointer_inside_window;
+        let should_collapse = !is_pointer_inside_window
+            && self.last_hovered_at.elapsed() >= Duration::from_millis(COLLAPSE_DELAY_MILLISECONDS);
+
+        if should_expand && !self.is_expanded {
+            self.is_expanded = true;
+            self.apply_dock_geometry(context);
+        } else if should_collapse && self.is_expanded {
+            self.is_expanded = false;
+            self.apply_dock_geometry(context);
+        }
+
+        context.request_repaint_after(Duration::from_millis(80));
+    }
+
+    fn update_monitor_rect(
+        &mut self,
+        context: &egui::Context,
+        frame: &eframe::Frame,
+        viewport_info: &egui::ViewportInfo,
+    ) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(window) = frame.winit_window() {
+            let pixels_per_point = context.pixels_per_point().max(1.0);
+            let monitor_rects: Vec<egui::Rect> = window
+                .available_monitors()
+                .map(|monitor| {
+                    let position = monitor.position();
+                    let size = monitor.size();
+                    egui::Rect::from_min_size(
+                        egui::pos2(
+                            position.x as f32 / pixels_per_point,
+                            position.y as f32 / pixels_per_point,
+                        ),
+                        egui::vec2(
+                            size.width as f32 / pixels_per_point,
+                            size.height as f32 / pixels_per_point,
+                        ),
+                    )
+                })
+                .collect();
+
+            if !monitor_rects.is_empty() {
+                self.available_monitor_rects = monitor_rects;
+            }
+
+            if self.is_dragging {
+                if let Some(cursor_position) = self.current_cursor_position(context) {
+                    self.last_known_monitor_rect = self.monitor_rect_for_position(cursor_position);
+                    return;
+                }
+            }
+
+            if let Some(monitor) = window.current_monitor() {
+                let position = monitor.position();
+                let size = monitor.size();
+                let monitor_position = egui::pos2(
+                    position.x as f32 / pixels_per_point,
+                    position.y as f32 / pixels_per_point,
+                );
+                let monitor_size = egui::vec2(
+                    size.width as f32 / pixels_per_point,
+                    size.height as f32 / pixels_per_point,
+                );
+
+                self.last_known_monitor_rect =
+                    egui::Rect::from_min_size(monitor_position, monitor_size);
+                return;
+            }
+        }
+
+        if let Some(monitor_size) = viewport_info.monitor_size {
+            self.last_known_monitor_rect =
+                egui::Rect::from_min_size(self.last_known_monitor_rect.min, monitor_size);
+        }
+    }
+
+    fn begin_title_bar_drag(&mut self, context: &egui::Context) {
+        let cursor_position = self
+            .current_cursor_position(context)
+            .unwrap_or(self.last_known_position + self.drag_pointer_offset);
+        self.drag_pointer_offset = cursor_position - self.last_known_position;
+        self.drag_pointer_offset.x = self
+            .drag_pointer_offset
+            .x
+            .clamp(8.0, NORMAL_WINDOW_WIDTH - 8.0);
+        self.drag_pointer_offset.y = self
+            .drag_pointer_offset
+            .y
+            .clamp(8.0, NORMAL_WINDOW_HEIGHT - 8.0);
+
+        self.highlighted_dock_edge = None;
+        self.drag_drop_target = None;
+        self.is_docked = false;
+        self.is_expanded = true;
+        self.is_dragging = true;
+        self.last_status_message = "상단바를 놓으면 위치가 확정됩니다.".to_owned();
+
+        context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+        context.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+        context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
+        self.update_drag_preview(context);
+    }
+
+    fn update_drag_preview(&mut self, context: &egui::Context) {
+        let pointer_released = context.input(|input| input.pointer.any_released());
+        let primary_down = is_primary_mouse_button_down().unwrap_or_else(|| {
+            context.input(|input| input.pointer.button_down(egui::PointerButton::Primary))
+        });
+
+        if pointer_released || !primary_down {
+            self.finish_title_bar_drag(context);
+            return;
+        }
+
+        let cursor_position = self
+            .current_cursor_position(context)
+            .unwrap_or(self.last_known_position + self.drag_pointer_offset);
+        let monitor_rect = self.monitor_rect_for_position(cursor_position);
+        self.last_known_monitor_rect = monitor_rect;
+
+        if let Some(edge) = edge_from_monitor_position(cursor_position, monitor_rect) {
+            self.highlighted_dock_edge = Some(edge);
+            self.drag_drop_target = Some(DragDropTarget::Dock { edge, monitor_rect });
+            self.dock_edge = edge;
+            self.dock_anchor_position = clamp_pos_to_rect(cursor_position, monitor_rect);
+            self.is_expanded = false;
+
+            let target_size = get_window_size(edge, false);
+            let target_position =
+                get_docked_position(edge, cursor_position, monitor_rect, target_size);
+            self.send_drag_preview_geometry(context, target_size, target_position);
+            self.last_status_message = format!("{} 도킹 미리보기", edge.korean_name());
+        } else {
+            self.highlighted_dock_edge = None;
+            self.drag_drop_target = Some(DragDropTarget::Window { monitor_rect });
+            self.is_expanded = true;
+
+            let target_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
+            let target_position = normal_window_position_for_cursor(
+                cursor_position,
+                self.drag_pointer_offset,
+                monitor_rect,
+            );
+            self.send_drag_preview_geometry(context, target_size, target_position);
+            self.last_status_message = "창 모드 미리보기".to_owned();
+        }
+    }
+
+    fn finish_title_bar_drag(&mut self, context: &egui::Context) {
+        let cursor_position = self
+            .current_cursor_position(context)
+            .unwrap_or(self.dock_anchor_position);
+        let target = self.drag_drop_target.take().unwrap_or_else(|| {
+            let monitor_rect = self.monitor_rect_for_position(cursor_position);
+            if let Some(edge) = edge_from_monitor_position(cursor_position, monitor_rect) {
+                DragDropTarget::Dock { edge, monitor_rect }
+            } else {
+                DragDropTarget::Window { monitor_rect }
+            }
+        });
+
+        match target {
+            DragDropTarget::Dock { edge, monitor_rect } => {
+                self.last_known_monitor_rect = monitor_rect;
+                self.dock_to_edge_at(edge, cursor_position, context);
+            }
+            DragDropTarget::Window { monitor_rect } => {
+                self.finish_window_mode_at(cursor_position, monitor_rect, context);
+            }
+        }
+    }
+
+    fn finish_window_mode_at(
+        &mut self,
+        cursor_position: egui::Pos2,
+        monitor_rect: egui::Rect,
+        context: &egui::Context,
+    ) {
+        let target_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
+        let target_position = normal_window_position_for_cursor(
+            cursor_position,
+            self.drag_pointer_offset,
+            monitor_rect,
+        );
+
+        self.highlighted_dock_edge = None;
+        self.drag_drop_target = None;
+        self.is_docked = false;
+        self.is_expanded = true;
+        self.is_dragging = false;
+        self.last_known_monitor_rect = monitor_rect;
+        self.last_known_position = target_position;
+        self.last_status_message = "창 모드로 배치했습니다.".to_owned();
+
+        context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Transparent(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+        context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
+        context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            360.0, 360.0,
+        )));
+        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_size));
+        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target_position));
+    }
+
+    fn send_drag_preview_geometry(
+        &self,
+        context: &egui::Context,
+        target_size: egui::Vec2,
+        target_position: egui::Pos2,
+    ) {
+        context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+        context.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+        context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
+        context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(1.0, 1.0)));
+        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_size));
+        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target_position));
+    }
+
+    fn current_cursor_position(&self, context: &egui::Context) -> Option<egui::Pos2> {
+        get_global_cursor_position(context.pixels_per_point()).or_else(|| {
+            context
+                .input(|input| input.pointer.interact_pos())
+                .map(|position| self.pointer_to_monitor_position(position))
+        })
+    }
+
+    fn monitor_rect_for_position(&self, position: egui::Pos2) -> egui::Rect {
+        self.available_monitor_rects
+            .iter()
+            .copied()
+            .find(|rect| rect.expand(2.0).contains(position))
+            .or_else(|| {
+                self.available_monitor_rects
+                    .iter()
+                    .copied()
+                    .min_by(|left, right| {
+                        distance_to_rect(position, *left)
+                            .partial_cmp(&distance_to_rect(position, *right))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
+            .unwrap_or(self.last_known_monitor_rect)
+    }
+
+    fn begin_expanded_resize(&mut self, edge: ResizeEdge, context: &egui::Context) {
+        let start_position = get_docked_position(
+            self.dock_edge,
+            self.dock_anchor_position,
+            self.last_known_monitor_rect,
+            self.expanded_size,
+        );
+        let start_window_rect = egui::Rect::from_min_size(start_position, self.expanded_size);
+
+        self.expanded_resize_drag = Some(ResizeDrag {
+            edge,
+            start_window_rect,
+        });
+        self.last_hovered_at = Instant::now();
+        self.last_status_message = "창 크기를 조절하는 중입니다.".to_owned();
+        context.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+    }
+
+    fn update_expanded_resize(&mut self, context: &egui::Context) {
+        let pointer_released = context.input(|input| input.pointer.any_released());
+        let primary_down = is_primary_mouse_button_down().unwrap_or_else(|| {
+            context.input(|input| input.pointer.button_down(egui::PointerButton::Primary))
+        });
+
+        if pointer_released || !primary_down {
+            self.finish_expanded_resize(context);
+            return;
+        }
+
+        let Some(resize_drag) = self.expanded_resize_drag else {
+            return;
+        };
+        let Some(cursor_position) = self.current_cursor_position(context) else {
+            return;
+        };
+
+        let mut resized_rect = resize_drag.start_window_rect;
+        if resize_drag.edge.affects_left() {
+            resized_rect.min.x = cursor_position.x;
+        }
+        if resize_drag.edge.affects_right() {
+            resized_rect.max.x = cursor_position.x;
+        }
+        if resize_drag.edge.affects_top() {
+            resized_rect.min.y = cursor_position.y;
+        }
+        if resize_drag.edge.affects_bottom() {
+            resized_rect.max.y = cursor_position.y;
+        }
+
+        resized_rect = clamp_resize_rect(
+            resized_rect,
+            resize_drag.edge,
+            self.dock_edge,
+            self.last_known_monitor_rect,
+        );
+        self.expanded_size =
+            clamp_expanded_size_to_monitor(resized_rect.size(), self.last_known_monitor_rect);
+        self.dock_anchor_position =
+            clamp_pos_to_rect(resized_rect.center(), self.last_known_monitor_rect);
+        self.is_docked = true;
+        self.is_expanded = true;
+        self.last_hovered_at = Instant::now();
+        self.apply_dock_geometry(context);
+    }
+
+    fn finish_expanded_resize(&mut self, context: &egui::Context) {
+        self.expanded_resize_drag = None;
+        self.expanded_size =
+            clamp_expanded_size_to_monitor(self.expanded_size, self.last_known_monitor_rect);
+        self.last_hovered_at = Instant::now();
+        self.apply_dock_geometry(context);
+        self.save_layout_settings();
+    }
+
+    fn save_layout_settings(&mut self) {
+        if let Err(error) =
+            save_tabs_to_configuration(&self.configuration_path, &self.tabs, self.expanded_size)
+        {
+            self.last_status_message = format!("창 크기 저장 실패: {error}");
+        }
+    }
+
+    fn docked_window_size(&self, is_expanded: bool) -> egui::Vec2 {
+        if is_expanded {
+            self.expanded_size
+        } else {
+            get_window_size(self.dock_edge, false)
+        }
+    }
+
+    fn apply_dock_geometry(&self, context: &egui::Context) {
+        let target_size = self.docked_window_size(self.is_expanded);
+        let target_position = get_docked_position(
+            self.dock_edge,
+            self.dock_anchor_position,
+            self.last_known_monitor_rect,
+            target_size,
+        );
+
+        context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+        context.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+        context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
+        context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(1.0, 1.0)));
+        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_size));
+        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target_position));
+    }
+
+    fn dock_to_edge_at(
+        &mut self,
+        edge: DockEdge,
+        anchor_position: egui::Pos2,
+        context: &egui::Context,
+    ) {
+        self.dock_edge = edge;
+        self.highlighted_dock_edge = None;
+        self.is_docked = true;
+        self.is_expanded = false;
+        self.is_dragging = false;
+        self.dock_anchor_position =
+            clamp_pos_to_rect(anchor_position, self.last_known_monitor_rect);
+        self.last_known_position = get_docked_position(
+            edge,
+            self.dock_anchor_position,
+            self.last_known_monitor_rect,
+            get_window_size(edge, false),
+        );
+        self.last_status_message = format!("{}에 도킹했습니다.", edge.korean_name());
+        self.apply_dock_geometry(context);
+    }
+
+    fn add_tab(&mut self) {
+        let tab_name = format!("탭 {}", self.next_tab_number);
+        self.next_tab_number += 1;
+        self.tabs.push(QuickDockTab::new(tab_name, Vec::new()));
+        self.active_tab_index = self.tabs.len().saturating_sub(1);
+        self.renaming_tab_index = Some(self.active_tab_index);
+        self.renaming_focus_pending = true;
+    }
+
+    fn close_active_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+
+        self.tabs.remove(self.active_tab_index);
+        self.active_tab_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+        self.renaming_tab_index = None;
+        self.renaming_focus_pending = false;
+    }
+
+    fn active_tab_name(&self) -> &str {
+        self.active_tab().name.as_str()
+    }
+
+    fn active_tab(&self) -> &QuickDockTab {
+        &self.tabs[self.active_tab_index.min(self.tabs.len().saturating_sub(1))]
+    }
+
+    fn active_tab_mut(&mut self) -> &mut QuickDockTab {
+        let index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+        &mut self.tabs[index]
+    }
+
+    fn open_settings_editor(&mut self) {
+        self.active_tab_mut().editable_items = self
+            .active_tab()
+            .items
+            .iter()
+            .map(EditableActionItem::from_action_item)
+            .collect();
+        self.is_settings_editor_open = true;
+        self.last_status_message = "설정을 편집 중입니다.".to_owned();
+    }
+
+    fn save_settings_editor(&mut self) {
+        let items: Vec<ActionItem> = self
+            .active_tab()
+            .editable_items
+            .iter()
+            .map(EditableActionItem::to_action_item)
+            .collect();
+
+        let active_index = self.active_tab_index;
+        self.tabs[active_index].items = items.clone();
+
+        match save_tabs_to_configuration(&self.configuration_path, &self.tabs, self.expanded_size) {
+            Ok(()) => {
+                self.last_status_message = "설정을 저장했습니다.".to_owned();
+                self.is_settings_editor_open = false;
+                self.last_hovered_at = Instant::now();
+            }
+            Err(error) => {
+                self.last_status_message = format!("설정 저장 실패: {error}");
+            }
+        }
+    }
+
+    fn cancel_settings_editor(&mut self) {
+        self.active_tab_mut().editable_items = self
+            .active_tab()
+            .items
+            .iter()
+            .map(EditableActionItem::from_action_item)
+            .collect();
+        self.is_settings_editor_open = false;
+        self.last_hovered_at = Instant::now();
+        self.last_status_message = "설정 편집을 취소했습니다.".to_owned();
+    }
+
+    fn add_editable_item(&mut self, kind: ActionKind) {
+        self.active_tab_mut()
+            .editable_items
+            .push(EditableActionItem::blank(kind));
+    }
+
+    fn close_related_explorer_windows(&mut self) {
+        match run_explorer_cleanup() {
+            Ok(()) => {
+                self.last_status_message = "중복/하위 탐색기 창을 정리했습니다.".to_owned();
+            }
+            Err(error) => {
+                self.last_status_message = format!("탐색기 정리 실패: {error}");
+            }
+        }
+    }
+
+    fn show_collapsed_user_interface(&mut self, ui: &mut egui::Ui) {
+        let available_rect = ui.max_rect();
+        let response = ui.interact(
+            available_rect,
+            ui.id().with("collapsed_drag_handle"),
+            egui::Sense::click(),
+        );
+
+        let painter = ui.painter();
+        let is_vertical = matches!(self.dock_edge, DockEdge::Left | DockEdge::Right);
+        let tab_rect = if is_vertical {
+            available_rect.shrink2(egui::vec2(3.0, 8.0))
+        } else {
+            available_rect.shrink2(egui::vec2(8.0, 3.0))
+        };
+        let background = if response.hovered() {
+            egui::Color32::from_rgb(19, 31, 39)
+        } else {
+            egui::Color32::from_rgb(12, 22, 29)
+        };
+
+        painter.rect_filled(
+            tab_rect.translate(egui::vec2(0.0, 2.0)),
+            13.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 72),
+        );
+        painter.rect_filled(tab_rect, 13.0, background);
+        painter.rect_stroke(
+            tab_rect,
+            13.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(74, 114, 137)),
+            egui::StrokeKind::Inside,
+        );
+
+        let accent = if response.hovered() {
+            egui::Color32::from_rgb(103, 232, 205)
+        } else {
+            egui::Color32::from_rgb(72, 189, 173)
+        };
+        let grip = egui::Color32::from_rgb(202, 224, 229);
+
+        if is_vertical {
+            let x = if self.dock_edge == DockEdge::Left {
+                tab_rect.right() - 4.0
+            } else {
+                tab_rect.left() + 4.0
+            };
+            painter.line_segment(
+                [
+                    egui::pos2(x, tab_rect.top() + 18.0),
+                    egui::pos2(x, tab_rect.bottom() - 18.0),
+                ],
+                egui::Stroke::new(2.0, accent),
+            );
+
+            for offset in [-10.0, 0.0, 10.0] {
+                painter.line_segment(
+                    [
+                        tab_rect.center() + egui::vec2(-4.0, offset),
+                        tab_rect.center() + egui::vec2(4.0, offset),
+                    ],
+                    egui::Stroke::new(1.7, grip),
+                );
+            }
+        } else {
+            let y = if self.dock_edge == DockEdge::Top {
+                tab_rect.bottom() - 4.0
+            } else {
+                tab_rect.top() + 4.0
+            };
+            painter.line_segment(
+                [
+                    egui::pos2(tab_rect.left() + 18.0, y),
+                    egui::pos2(tab_rect.right() - 18.0, y),
+                ],
+                egui::Stroke::new(2.0, accent),
+            );
+
+            for offset in [-10.0, 0.0, 10.0] {
+                painter.line_segment(
+                    [
+                        tab_rect.center() + egui::vec2(offset, -4.0),
+                        tab_rect.center() + egui::vec2(offset, 4.0),
+                    ],
+                    egui::Stroke::new(1.7, grip),
+                );
+            }
+        }
+
+        if response.clicked() {
+            self.is_expanded = true;
+            self.apply_dock_geometry(ui.ctx());
+        }
+    }
+
+    fn show_drag_preview_user_interface(&mut self, ui: &mut egui::Ui) {
+        let available_rect = ui.max_rect();
+        let painter = ui.painter();
+
+        if let Some(edge) = self.highlighted_dock_edge {
+            let is_vertical = matches!(edge, DockEdge::Left | DockEdge::Right);
+            let tab_rect = if is_vertical {
+                available_rect.shrink2(egui::vec2(3.0, 8.0))
+            } else {
+                available_rect.shrink2(egui::vec2(8.0, 3.0))
+            };
+
+            painter.rect_filled(
+                tab_rect.translate(egui::vec2(0.0, 2.0)),
+                14.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 70),
+            );
+            painter.rect_filled(
+                tab_rect,
+                14.0,
+                egui::Color32::from_rgba_unmultiplied(9, 24, 31, 190),
+            );
+            painter.rect_stroke(
+                tab_rect,
+                14.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(109, 214, 204)),
+                egui::StrokeKind::Inside,
+            );
+
+            let accent = egui::Color32::from_rgb(103, 232, 205);
+            let grip = egui::Color32::from_rgb(218, 236, 239);
+
+            if is_vertical {
+                let x = if edge == DockEdge::Left {
+                    tab_rect.right() - 4.0
+                } else {
+                    tab_rect.left() + 4.0
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(x, tab_rect.top() + 15.0),
+                        egui::pos2(x, tab_rect.bottom() - 15.0),
+                    ],
+                    egui::Stroke::new(1.8, accent),
+                );
+
+                for offset in [-8.0, 0.0, 8.0] {
+                    painter.line_segment(
+                        [
+                            tab_rect.center() + egui::vec2(-4.0, offset),
+                            tab_rect.center() + egui::vec2(4.0, offset),
+                        ],
+                        egui::Stroke::new(1.4, grip),
+                    );
+                }
+            } else {
+                let y = if edge == DockEdge::Top {
+                    tab_rect.bottom() - 4.0
+                } else {
+                    tab_rect.top() + 4.0
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(tab_rect.left() + 15.0, y),
+                        egui::pos2(tab_rect.right() - 15.0, y),
+                    ],
+                    egui::Stroke::new(1.8, accent),
+                );
+
+                for offset in [-8.0, 0.0, 8.0] {
+                    painter.line_segment(
+                        [
+                            tab_rect.center() + egui::vec2(offset, -4.0),
+                            tab_rect.center() + egui::vec2(offset, 4.0),
+                        ],
+                        egui::Stroke::new(1.4, grip),
+                    );
+                }
+            }
+        } else {
+            let panel_rect = available_rect.shrink(6.0);
+            let title_rect = egui::Rect::from_min_size(
+                panel_rect.min,
+                egui::vec2(panel_rect.width(), TITLE_BAR_HEIGHT),
+            );
+
+            painter.rect_filled(
+                panel_rect,
+                8.0,
+                egui::Color32::from_rgba_unmultiplied(242, 246, 248, 190),
+            );
+            painter.rect_stroke(
+                panel_rect,
+                8.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(125, 155, 171)),
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_filled(
+                title_rect,
+                8.0,
+                egui::Color32::from_rgba_unmultiplied(24, 40, 50, 175),
+            );
+            painter.text(
+                title_rect.left_center() + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                "Quick Dock",
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
+            painter.text(
+                title_rect.right_center() - egui::vec2(14.0, 0.0),
+                egui::Align2::CENTER_CENTER,
+                "X",
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+
+            let line_color = egui::Color32::from_rgba_unmultiplied(57, 82, 96, 135);
+            for row in 0..5 {
+                let y = title_rect.bottom() + 28.0 + row as f32 * 34.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(panel_rect.left() + 22.0, y),
+                        egui::pos2(panel_rect.right() - 22.0, y),
+                    ],
+                    egui::Stroke::new(1.0, line_color),
+                );
+            }
+        }
+    }
+
+    fn show_expanded_user_interface(&mut self, ui: &mut egui::Ui) {
+        let resize_rect = ui.max_rect();
+        egui::Frame::default()
+            .fill(egui::Color32::from_rgb(242, 246, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(185, 197, 205),
+            ))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                self.show_header(ui);
+                ui.add_space(6.0);
+                self.show_tab_strip(ui);
+                ui.add_space(8.0);
+
+                if self.is_settings_editor_open {
+                    self.show_settings_editor(ui);
+                } else if self.active_tab().items.is_empty() {
+                    ui.label("env\\quick_dock.ini에 등록된 항목이 없습니다.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let items = self.active_tab().items.clone();
+                            for item in items {
+                                self.show_action_button(ui, &item);
+                                ui.add_space(4.0);
+                            }
+                        });
+                }
+
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(self.active_tab_name()).strong());
+                    ui.label(shorten_text(&self.last_status_message, 46));
+                });
+            });
+
+        self.show_expanded_resize_handles(ui, resize_rect);
+    }
+
+    fn show_expanded_resize_handles(&mut self, ui: &mut egui::Ui, frame_rect: egui::Rect) {
+        if !self.is_docked || !self.is_expanded || self.is_dragging {
+            return;
+        }
+
+        let context = ui.ctx().clone();
+        for (edge, rect) in resize_handle_rects(frame_rect, self.dock_edge) {
+            let response = ui.interact(
+                rect,
+                ui.id().with(("expanded_resize", edge.id_salt())),
+                egui::Sense::click_and_drag(),
+            );
+
+            if response.hovered() || response.dragged() {
+                ui.output_mut(|output| output.cursor_icon = edge.cursor_icon());
+            }
+
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                self.begin_expanded_resize(edge, &context);
+            }
+        }
+    }
+
+    fn show_action_button(&mut self, ui: &mut egui::Ui, item: &ActionItem) {
+        let button_label = format_action_button_label(item);
+        let response = ui.add_sized(
+            [ui.available_width(), 34.0],
+            egui::Button::new(button_label),
+        );
+
+        match item {
+            ActionItem::CopyText { name, text } => {
+                let response = response.on_hover_ui(|ui| {
+                    show_copy_text_preview(ui, name, text);
+                });
+
+                let mut copy_from_context_menu = false;
+                response.context_menu(|ui| {
+                    show_copy_text_preview(ui, name, text);
+                    ui.separator();
+
+                    if ui.button("복사").clicked() {
+                        copy_from_context_menu = true;
+                        ui.close();
+                    }
+                });
+
+                if response.clicked() || copy_from_context_menu {
+                    self.copy_text_to_clipboard(name, text);
+                }
+            }
+            _ => {
+                if response.clicked() {
+                    self.execute_action(item);
+                }
+            }
+        }
+    }
+
+    fn show_header(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                let close_size = egui::vec2(30.0, TITLE_BAR_HEIGHT);
+                let title_width = (ui.available_width() - close_size.x - 4.0).max(80.0);
+                let (title_rect, title_response) = ui.allocate_exact_size(
+                    egui::vec2(title_width, TITLE_BAR_HEIGHT),
+                    egui::Sense::click_and_drag(),
+                );
+
+                let title_fill = if title_response.dragged() {
+                    egui::Color32::from_rgb(224, 234, 238)
+                } else if title_response.hovered() {
+                    egui::Color32::from_rgb(232, 240, 244)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(title_rect, 4.0, title_fill);
+                ui.painter().text(
+                    title_rect.left_center() + egui::vec2(6.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    "Quick Dock",
+                    egui::FontId::proportional(17.0),
+                    egui::Color32::from_rgb(22, 35, 43),
+                );
+
+                if title_response.hovered() {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Grab);
+                }
+
+                if title_response.drag_started_by(egui::PointerButton::Primary) {
+                    self.begin_title_bar_drag(ui.ctx());
+                }
+
+                let close_response = ui.add_sized(
+                    close_size,
+                    egui::Button::new(egui::RichText::new("X").strong().size(14.0))
+                        .fill(egui::Color32::TRANSPARENT),
+                );
+
+                if close_response.clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("새 탭").clicked() {
+                    self.add_tab();
+                }
+
+                if ui.small_button("다시 읽기").clicked() {
+                    self.reload_configuration();
+                }
+
+                if ui.small_button("탐색기 정리").clicked() {
+                    self.close_related_explorer_windows();
+                }
+
+                if ui.small_button("설정").clicked() {
+                    if self.is_settings_editor_open {
+                        self.cancel_settings_editor();
+                    } else {
+                        self.open_settings_editor();
+                    }
+                }
+            });
+        });
+    }
+
+    fn show_tab_strip(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let mut tab_to_close = None;
+            let mut tab_to_rename = None;
+            let mut finish_renaming = false;
+
+            for index in 0..self.tabs.len() {
+                let is_active = index == self.active_tab_index;
+                let is_renaming = self.renaming_tab_index == Some(index);
+
+                let response = if is_renaming {
+                    let response = ui.add_sized(
+                        [110.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.tabs[index].name).desired_width(110.0),
+                    );
+                    if self.renaming_focus_pending {
+                        response.request_focus();
+                        self.renaming_focus_pending = false;
+                    }
+                    response
+                } else {
+                    let tab_name = self.tabs[index].name.clone();
+                    ui.selectable_label(is_active, tab_name)
+                };
+
+                if response.clicked() {
+                    self.active_tab_index = index;
+                    if !is_renaming {
+                        self.renaming_tab_index = None;
+                    }
+                }
+
+                if is_renaming {
+                    let pressed_enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let pressed_escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+                    let clicked_elsewhere =
+                        response.lost_focus() && ui.input(|input| input.pointer.any_pressed());
+
+                    if pressed_enter || pressed_escape || clicked_elsewhere {
+                        finish_renaming = true;
+                    }
+                }
+
+                response.context_menu(|ui| {
+                    ui.set_min_width(120.0);
+                    if ui.button("이름 변경").clicked() {
+                        tab_to_rename = Some(index);
+                        ui.close();
+                    }
+
+                    if self.tabs.len() > 1 && ui.button("탭 닫기").clicked() {
+                        tab_to_close = Some(index);
+                        ui.close();
+                    }
+                });
+            }
+
+            if finish_renaming {
+                if let Some(index) = self.renaming_tab_index {
+                    if self.tabs[index].name.trim().is_empty() {
+                        self.tabs[index].name = format!("탭 {}", index + 1);
+                    }
+                }
+                self.renaming_tab_index = None;
+                self.renaming_focus_pending = false;
+            }
+
+            if let Some(index) = tab_to_rename {
+                self.active_tab_index = index;
+                self.renaming_tab_index = Some(index);
+                self.renaming_focus_pending = true;
+            }
+
+            if let Some(index) = tab_to_close {
+                self.active_tab_index = index;
+                self.close_active_tab();
+            }
+        });
+    }
+
+    fn show_settings_editor(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("저장").clicked() {
+                self.save_settings_editor();
+            }
+
+            if ui.button("취소").clicked() {
+                self.cancel_settings_editor();
+            }
+
+            ui.separator();
+
+            egui::ComboBox::from_id_salt("new_item_kind")
+                .selected_text(self.new_item_kind.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.new_item_kind, ActionKind::CopyText, "복사");
+                    ui.selectable_value(
+                        &mut self.new_item_kind,
+                        ActionKind::RunApplication,
+                        "실행",
+                    );
+                    ui.selectable_value(&mut self.new_item_kind, ActionKind::OpenPath, "열기");
+                });
+
+            if ui.small_button("추가").clicked() {
+                self.add_editable_item(self.new_item_kind);
+            }
+        });
+
+        ui.add_space(8.0);
+
+        let mut remove_index = None;
+        let mut move_up_index = None;
+        let mut move_down_index = None;
+        let item_count = self.active_tab().editable_items.len();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for index in 0..self.active_tab().editable_items.len() {
+                    let title = format!(
+                        "{} · {}",
+                        self.active_tab().editable_items[index].kind.label(),
+                        shorten_text(&self.active_tab().editable_items[index].name, 24)
+                    );
+
+                    let response = egui::CollapsingHeader::new(title)
+                        .id_salt(("setting_item", index))
+                        .default_open(index == 0)
+                        .show(ui, |ui| {
+                            let item = &mut self.active_tab_mut().editable_items[index];
+                            show_editable_action_item(ui, index, item);
+                        });
+
+                    response.header_response.context_menu(|ui| {
+                        if ui
+                            .add_enabled(index > 0, egui::Button::new("위로"))
+                            .clicked()
+                        {
+                            move_up_index = Some(index);
+                            ui.close();
+                        }
+
+                        if ui
+                            .add_enabled(index + 1 < item_count, egui::Button::new("아래로"))
+                            .clicked()
+                        {
+                            move_down_index = Some(index);
+                            ui.close();
+                        }
+
+                        if ui.button("삭제").clicked() {
+                            remove_index = Some(index);
+                            ui.close();
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                }
+            });
+
+        if let Some(index) = move_up_index {
+            self.active_tab_mut().editable_items.swap(index, index - 1);
+        }
+
+        if let Some(index) = move_down_index {
+            self.active_tab_mut().editable_items.swap(index, index + 1);
+        }
+
+        if let Some(index) = remove_index {
+            self.active_tab_mut().editable_items.remove(index);
+        }
+    }
+
+    fn pointer_to_monitor_position(&self, pointer_position: egui::Pos2) -> egui::Pos2 {
+        self.last_known_inner_position + pointer_position.to_vec2()
+    }
+
+    fn execute_action(&mut self, item: &ActionItem) {
+        match item {
+            ActionItem::CopyText { name, text } => {
+                self.copy_text_to_clipboard(name, text);
+            }
+            ActionItem::RunApplication {
+                name,
+                command,
+                arguments,
+            } => {
+                self.run_application(name, command, arguments);
+            }
+            ActionItem::OpenPath { name, path } => {
+                self.open_path(name, path);
+            }
+        }
+    }
+
+    fn copy_text_to_clipboard(&mut self, name: &str, text: &str) {
+        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_owned())) {
+            Ok(()) => {
+                self.last_status_message = format!("복사되었습니다: {name}");
+                self.show_toast("복사되었습니다", false);
+            }
+            Err(error) => {
+                self.last_status_message = format!("복사 실패: {error}");
+                self.show_toast("복사 실패", true);
+            }
+        }
+    }
+
+    fn show_toast(&mut self, message: impl Into<String>, is_error: bool) {
+        self.toast_message = Some(message.into());
+        self.toast_started_at = Instant::now();
+        self.toast_is_error = is_error;
+    }
+
+    fn show_toast_overlay(&mut self, context: &egui::Context) {
+        let Some(message) = self.toast_message.clone() else {
+            return;
+        };
+
+        if self.toast_started_at.elapsed() >= Duration::from_millis(TOAST_DURATION_MILLISECONDS) {
+            self.toast_message = None;
+            return;
+        }
+
+        context.request_repaint_after(Duration::from_millis(80));
+
+        let fill = if self.toast_is_error {
+            egui::Color32::from_rgb(188, 55, 68)
+        } else {
+            egui::Color32::from_rgb(28, 142, 86)
+        };
+
+        egui::Area::new(egui::Id::new("quick_dock_toast"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+            .show(context, |ui| {
+                egui::Frame::default()
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+                    ))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(message)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                    });
+            });
+    }
+
+    fn run_application(&mut self, name: &str, command: &str, arguments: &[String]) {
+        let expanded_command = expand_environment_variables(command);
+        let resolved_command = resolve_application_command(&expanded_command);
+        let expanded_arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| expand_environment_variables(argument))
+            .collect();
+
+        match Command::new(&resolved_command)
+            .args(expanded_arguments)
+            .spawn()
+        {
+            Ok(_) => {
+                self.last_status_message = format!("실행 완료: {name}");
+            }
+            Err(error) => {
+                self.last_status_message = format!("실행 실패: {error} ({resolved_command})");
+            }
+        }
+    }
+
+    fn open_path(&mut self, name: &str, path: &str) {
+        let expanded_path = expand_environment_variables(path);
+
+        #[cfg(target_os = "windows")]
+        let result = Command::new("explorer.exe").arg(expanded_path).spawn();
+
+        #[cfg(target_os = "macos")]
+        let result = Command::new("open").arg(expanded_path).spawn();
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let result = Command::new("xdg-open").arg(expanded_path).spawn();
+
+        match result {
+            Ok(_) => {
+                self.last_status_message = format!("열기 완료: {name}");
+            }
+            Err(error) => {
+                self.last_status_message = format!("열기 실패: {error}");
+            }
+        }
+    }
+}
+
+impl eframe::App for QuickDockApplication {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.is_docked || self.is_dragging {
+            egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+        } else {
+            egui::Color32::from_rgb(242, 246, 248).to_normalized_gamma_f32()
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let context = ui.ctx().clone();
+        self.update_window_state(&context, frame);
+
+        if self.is_dragging {
+            let _ = frame;
+            self.show_drag_preview_user_interface(ui);
+        } else if self.is_expanded {
+            let _ = frame;
+            self.show_expanded_user_interface(ui);
+        } else {
+            self.show_collapsed_user_interface(ui);
+        }
+
+        self.show_toast_overlay(&context);
+    }
+}
+
+fn get_window_size(dock_edge: DockEdge, is_expanded: bool) -> egui::Vec2 {
+    if is_expanded {
+        return egui::vec2(EXPANDED_WIDTH, EXPANDED_HEIGHT);
+    }
+
+    match dock_edge {
+        DockEdge::Left | DockEdge::Right => egui::vec2(COLLAPSED_THICKNESS, COLLAPSED_LENGTH),
+        DockEdge::Top | DockEdge::Bottom => egui::vec2(COLLAPSED_LENGTH, COLLAPSED_THICKNESS),
+    }
+}
+
+fn default_expanded_size() -> egui::Vec2 {
+    egui::vec2(EXPANDED_WIDTH, EXPANDED_HEIGHT)
+}
+
+fn clamp_expanded_size(size: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        size.x.clamp(MIN_EXPANDED_WIDTH, MAX_EXPANDED_WIDTH),
+        size.y.clamp(MIN_EXPANDED_HEIGHT, MAX_EXPANDED_HEIGHT),
+    )
+}
+
+fn clamp_expanded_size_to_monitor(size: egui::Vec2, monitor_rect: egui::Rect) -> egui::Vec2 {
+    let maximum_width = monitor_rect.width().max(MIN_EXPANDED_WIDTH);
+    let maximum_height = monitor_rect.height().max(MIN_EXPANDED_HEIGHT);
+    let maximum_size = egui::vec2(
+        MAX_EXPANDED_WIDTH.min(maximum_width),
+        MAX_EXPANDED_HEIGHT.min(maximum_height),
+    );
+
+    egui::vec2(
+        size.x.clamp(MIN_EXPANDED_WIDTH, maximum_size.x),
+        size.y.clamp(MIN_EXPANDED_HEIGHT, maximum_size.y),
+    )
+}
+
+fn resize_handle_rects(
+    window_rect: egui::Rect,
+    _dock_edge: DockEdge,
+) -> Vec<(ResizeEdge, egui::Rect)> {
+    let corner = RESIZE_HANDLE_THICKNESS * 2.4;
+    let left = window_rect.left();
+    let right = window_rect.right();
+    let top = window_rect.top();
+    let bottom = window_rect.bottom();
+
+    let top_left = egui::Rect::from_min_size(window_rect.left_top(), egui::vec2(corner, corner));
+    let top_right = egui::Rect::from_min_max(
+        egui::pos2(right - corner, top),
+        egui::pos2(right, top + corner),
+    );
+    let bottom_left = egui::Rect::from_min_max(
+        egui::pos2(left, bottom - corner),
+        egui::pos2(left + corner, bottom),
+    );
+    let bottom_right = egui::Rect::from_min_max(
+        egui::pos2(right - corner, bottom - corner),
+        window_rect.right_bottom(),
+    );
+
+    vec![
+        (ResizeEdge::TopLeft, top_left),
+        (ResizeEdge::TopRight, top_right),
+        (ResizeEdge::BottomLeft, bottom_left),
+        (ResizeEdge::BottomRight, bottom_right),
+    ]
+}
+
+fn clamp_resize_rect(
+    mut rect: egui::Rect,
+    resize_edge: ResizeEdge,
+    dock_edge: DockEdge,
+    monitor_rect: egui::Rect,
+) -> egui::Rect {
+    match dock_edge {
+        DockEdge::Left => rect.min.x = monitor_rect.min.x,
+        DockEdge::Right => rect.max.x = monitor_rect.max.x,
+        DockEdge::Top => rect.min.y = monitor_rect.min.y,
+        DockEdge::Bottom => rect.max.y = monitor_rect.max.y,
+    }
+
+    rect.min.x = rect.min.x.clamp(monitor_rect.min.x, monitor_rect.max.x);
+    rect.max.x = rect.max.x.clamp(monitor_rect.min.x, monitor_rect.max.x);
+    rect.min.y = rect.min.y.clamp(monitor_rect.min.y, monitor_rect.max.y);
+    rect.max.y = rect.max.y.clamp(monitor_rect.min.y, monitor_rect.max.y);
+
+    if rect.width() < MIN_EXPANDED_WIDTH {
+        if resize_edge.affects_left() {
+            rect.min.x = rect.max.x - MIN_EXPANDED_WIDTH;
+        } else {
+            rect.max.x = rect.min.x + MIN_EXPANDED_WIDTH;
+        }
+    }
+
+    if rect.height() < MIN_EXPANDED_HEIGHT {
+        if resize_edge.affects_top() {
+            rect.min.y = rect.max.y - MIN_EXPANDED_HEIGHT;
+        } else {
+            rect.max.y = rect.min.y + MIN_EXPANDED_HEIGHT;
+        }
+    }
+
+    if rect.width() > MAX_EXPANDED_WIDTH {
+        if resize_edge.affects_left() {
+            rect.min.x = rect.max.x - MAX_EXPANDED_WIDTH;
+        } else {
+            rect.max.x = rect.min.x + MAX_EXPANDED_WIDTH;
+        }
+    }
+
+    if rect.height() > MAX_EXPANDED_HEIGHT {
+        if resize_edge.affects_top() {
+            rect.min.y = rect.max.y - MAX_EXPANDED_HEIGHT;
+        } else {
+            rect.max.y = rect.min.y + MAX_EXPANDED_HEIGHT;
+        }
+    }
+
+    rect.min.x = rect.min.x.clamp(monitor_rect.min.x, monitor_rect.max.x);
+    rect.max.x = rect.max.x.clamp(monitor_rect.min.x, monitor_rect.max.x);
+    rect.min.y = rect.min.y.clamp(monitor_rect.min.y, monitor_rect.max.y);
+    rect.max.y = rect.max.y.clamp(monitor_rect.min.y, monitor_rect.max.y);
+    rect
+}
+
+fn edge_from_monitor_position(
+    pointer_position: egui::Pos2,
+    monitor_rect: egui::Rect,
+) -> Option<DockEdge> {
+    let distances = [
+        (
+            DockEdge::Left,
+            (pointer_position.x - monitor_rect.min.x).abs(),
+        ),
+        (
+            DockEdge::Right,
+            (monitor_rect.max.x - pointer_position.x).abs(),
+        ),
+        (
+            DockEdge::Top,
+            (pointer_position.y - monitor_rect.min.y).abs(),
+        ),
+        (
+            DockEdge::Bottom,
+            (monitor_rect.max.y - pointer_position.y).abs(),
+        ),
+    ];
+
+    distances
+        .into_iter()
+        .filter(|(_, distance)| *distance <= SCREEN_EDGE_DROP_DISTANCE)
+        .min_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(edge, _)| edge)
+}
+
+fn clamp_pos_to_rect(position: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        position.x.clamp(rect.min.x, rect.max.x),
+        position.y.clamp(rect.min.y, rect.max.y),
+    )
+}
+
+fn normal_window_position_for_cursor(
+    cursor_position: egui::Pos2,
+    pointer_offset: egui::Vec2,
+    monitor_rect: egui::Rect,
+) -> egui::Pos2 {
+    let target_size = egui::vec2(NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
+    clamp_window_position(cursor_position - pointer_offset, target_size, monitor_rect)
+}
+
+fn clamp_window_position(
+    position: egui::Pos2,
+    window_size: egui::Vec2,
+    monitor_rect: egui::Rect,
+) -> egui::Pos2 {
+    let maximum_x = (monitor_rect.max.x - window_size.x).max(monitor_rect.min.x);
+    let maximum_y = (monitor_rect.max.y - window_size.y).max(monitor_rect.min.y);
+
+    egui::pos2(
+        position.x.clamp(monitor_rect.min.x, maximum_x),
+        position.y.clamp(monitor_rect.min.y, maximum_y),
+    )
+}
+
+fn distance_to_rect(position: egui::Pos2, rect: egui::Rect) -> f32 {
+    let dx = if position.x < rect.min.x {
+        rect.min.x - position.x
+    } else if position.x > rect.max.x {
+        position.x - rect.max.x
+    } else {
+        0.0
+    };
+    let dy = if position.y < rect.min.y {
+        rect.min.y - position.y
+    } else if position.y > rect.max.y {
+        position.y - rect.max.y
+    } else {
+        0.0
+    };
+
+    dx * dx + dy * dy
+}
+
+fn is_primary_mouse_button_down() -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+
+        let state = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) };
+        return Some((state & i16::MIN) != 0);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+fn get_global_cursor_position(pixels_per_point: f32) -> Option<egui::Pos2> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+        let mut point = POINT { x: 0, y: 0 };
+        let ok = unsafe { GetCursorPos(&mut point) };
+        if ok != 0 {
+            let scale = pixels_per_point.max(1.0);
+            return Some(egui::pos2(point.x as f32 / scale, point.y as f32 / scale));
+        }
+    }
+
+    let _ = pixels_per_point;
+    None
+}
+
+fn get_docked_position(
+    dock_edge: DockEdge,
+    anchor_position: egui::Pos2,
+    monitor_rect: egui::Rect,
+    target_size: egui::Vec2,
+) -> egui::Pos2 {
+    let maximum_x = (monitor_rect.max.x - target_size.x).max(monitor_rect.min.x);
+    let maximum_y = (monitor_rect.max.y - target_size.y).max(monitor_rect.min.y);
+    let centered_x = anchor_position.x - target_size.x * 0.5;
+    let centered_y = anchor_position.y - target_size.y * 0.5;
+
+    match dock_edge {
+        DockEdge::Left => egui::pos2(
+            monitor_rect.min.x,
+            centered_y.clamp(monitor_rect.min.y, maximum_y),
+        ),
+        DockEdge::Right => egui::pos2(maximum_x, centered_y.clamp(monitor_rect.min.y, maximum_y)),
+        DockEdge::Top => egui::pos2(
+            centered_x.clamp(monitor_rect.min.x, maximum_x),
+            monitor_rect.min.y,
+        ),
+        DockEdge::Bottom => egui::pos2(centered_x.clamp(monitor_rect.min.x, maximum_x), maximum_y),
+    }
+}
+
+fn format_action_button_label(item: &ActionItem) -> String {
+    let name = shorten_text(item.name(), 30);
+    match item {
+        ActionItem::CopyText { .. } => format!("복사 · {name}"),
+        ActionItem::RunApplication { .. } => format!("실행 · {name}"),
+        ActionItem::OpenPath { .. } => format!("열기 · {name}"),
+    }
+}
+
+fn show_copy_text_preview(ui: &mut egui::Ui, name: &str, text: &str) {
+    ui.set_max_width(360.0);
+    ui.label(egui::RichText::new(name).strong());
+    ui.separator();
+
+    let preview_text = if text.trim().is_empty() {
+        "(내용 없음)"
+    } else {
+        text
+    };
+
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(preview_text).monospace()).wrap());
+        });
+}
+
+fn show_editable_action_item(ui: &mut egui::Ui, index: usize, item: &mut EditableActionItem) {
+    ui.horizontal(|ui| {
+        ui.label("종류");
+        egui::ComboBox::from_id_salt(("action_kind", index))
+            .selected_text(item.kind.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut item.kind, ActionKind::CopyText, "복사");
+                ui.selectable_value(&mut item.kind, ActionKind::RunApplication, "실행");
+                ui.selectable_value(&mut item.kind, ActionKind::OpenPath, "열기");
+            });
+    });
+
+    ui.label("이름");
+    ui.text_edit_singleline(&mut item.name);
+
+    match item.kind {
+        ActionKind::CopyText => {
+            ui.label("복사할 내용");
+            ui.add_sized(
+                [ui.available_width(), 96.0],
+                egui::TextEdit::multiline(&mut item.text),
+            );
+        }
+        ActionKind::RunApplication => {
+            ui.label("실행 파일 또는 명령");
+            ui.text_edit_singleline(&mut item.command);
+            ui.label("인자");
+            ui.text_edit_singleline(&mut item.arguments);
+        }
+        ActionKind::OpenPath => {
+            ui.label("파일/폴더 경로");
+            ui.text_edit_singleline(&mut item.path);
+        }
+    }
+}
+
+fn run_explorer_cleanup() -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = r#"
+function Normalize-ExplorerPath([string]$path) {
+    try {
+        return [System.IO.Path]::GetFullPath($path).TrimEnd('\')
+    } catch {
+        return $path.TrimEnd('\')
+    }
+}
+
+function Test-IsChildPath([string]$parent, [string]$child) {
+    if ($parent.Length -eq 0 -or $child.Length -le $parent.Length) { return $false }
+    return $child.StartsWith($parent + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+$shell = New-Object -ComObject Shell.Application
+$entries = New-Object System.Collections.Generic.List[object]
+$index = 0
+
+foreach ($window in @($shell.Windows())) {
+    try {
+        if (-not $window.FullName.ToLowerInvariant().EndsWith('explorer.exe')) { continue }
+        $path = $window.Document.Folder.Self.Path
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+
+        $entries.Add([pscustomobject]@{
+            Window = $window
+            Path = Normalize-ExplorerPath $path
+            Index = $index
+        })
+        $index++
+    } catch {}
+}
+
+$keepIndexes = New-Object System.Collections.Generic.HashSet[int]
+$paths = @($entries | Select-Object -ExpandProperty Path -Unique)
+
+foreach ($path in $paths) {
+    $first = @($entries | Where-Object { $_.Path -ieq $path } | Sort-Object Index | Select-Object -First 1)
+    if ($first.Count -gt 0) { [void]$keepIndexes.Add($first[0].Index) }
+}
+
+foreach ($entry in $entries) {
+    $hasOpenParent = $false
+    foreach ($path in $paths) {
+        if (Test-IsChildPath $path $entry.Path) {
+            $hasOpenParent = $true
+            break
+        }
+    }
+
+    if (-not $keepIndexes.Contains($entry.Index) -or $hasOpenParent) {
+        try { $entry.Window.Quit() } catch {}
+    }
+}
+"#;
+
+        let status = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .status()?;
+
+        if !status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("PowerShell 종료 코드: {status}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn shorten_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let shortened: String = chars.by_ref().take(max_chars).collect();
+
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
+}
+
+fn configure_system_fonts(context: &egui::Context) {
+    if let Some(font_bytes) = load_first_existing_font(system_font_candidates()) {
+        let mut fonts = egui::FontDefinitions::default();
+        let font_name = "quick_dock_system_cjk".to_owned();
+
+        fonts.font_data.insert(
+            font_name.clone(),
+            Arc::new(egui::FontData::from_owned(font_bytes)),
+        );
+
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .insert(0, font_name.clone());
+        }
+
+        context.set_fonts(fonts);
+    }
+}
+
+fn load_first_existing_font(paths: &[&str]) -> Option<Vec<u8>> {
+    paths.iter().find_map(|path| fs::read(path).ok())
+}
+
+fn system_font_candidates() -> &'static [&'static str] {
+    &[
+        r"C:\Windows\Fonts\malgun.ttf",
+        r"C:\Windows\Fonts\malgunbd.ttf",
+        r"C:\Windows\Fonts\gulim.ttc",
+        r"C:\Windows\Fonts\batang.ttc",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]
+}
+
+fn get_configuration_path() -> PathBuf {
+    let executable_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let executable_directory = executable_path.parent().unwrap_or_else(|| Path::new("."));
+    executable_directory
+        .join(CONFIGURATION_DIRECTORY_NAME)
+        .join(CONFIGURATION_FILE_NAME)
+}
+
+fn load_tabs_from_configuration(
+    configuration_path: &Path,
+) -> (Vec<QuickDockTab>, egui::Vec2, String) {
+    let was_created = ensure_configuration_file(configuration_path);
+
+    match fs::read_to_string(configuration_path) {
+        Ok(configuration_text) => {
+            let expanded_size = parse_expanded_size_from_ini(&configuration_text)
+                .unwrap_or_else(default_expanded_size);
+
+            match parse_tabs_from_ini(&configuration_text) {
+                Ok(tabs) => {
+                    let item_count: usize = tabs.iter().map(|tab| tab.items.len()).sum();
+                    let tab_count = tabs.len();
+                    let message = if was_created {
+                        format!("기본 설정 생성 완료: {tab_count}개 탭, {item_count}개 항목")
+                    } else {
+                        format!("설정 읽기 완료: {tab_count}개 탭, {item_count}개 항목")
+                    };
+                    (tabs, expanded_size, message)
+                }
+                Err(error) => (
+                    vec![QuickDockTab::new("기본".to_owned(), get_default_items())],
+                    expanded_size,
+                    format!("설정 파싱 실패. 기본 항목 사용: {error}"),
+                ),
+            }
+        }
+        Err(error) => (
+            vec![QuickDockTab::new("기본".to_owned(), get_default_items())],
+            default_expanded_size(),
+            format!("설정 파일 읽기 실패. 기본 항목 사용: {error}"),
+        ),
+    }
+}
+
+fn ensure_configuration_file(configuration_path: &Path) -> bool {
+    if configuration_path.exists() {
+        return false;
+    }
+
+    if let Some(parent) = configuration_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    fs::write(configuration_path, get_default_ini_text()).is_ok()
+}
+
+fn save_tabs_to_configuration(
+    configuration_path: &Path,
+    tabs: &[QuickDockTab],
+    expanded_size: egui::Vec2,
+) -> std::io::Result<()> {
+    if let Some(parent) = configuration_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(
+        configuration_path,
+        serialize_tabs_to_ini(tabs, expanded_size),
+    )
+}
+
+fn serialize_tabs_to_ini(tabs: &[QuickDockTab], expanded_size: egui::Vec2) -> String {
+    let expanded_size = clamp_expanded_size(expanded_size);
+    let mut output = String::from(
+        "; Quick Dock 설정 파일\n; 앱 안의 설정 화면에서 편집할 수 있습니다.\n; 실행 인자는 | 로 구분합니다.\n\n",
+    );
+
+    output.push_str("[layout]\n");
+    output.push_str(&format!("expanded_width={:.0}\n", expanded_size.x));
+    output.push_str(&format!("expanded_height={:.0}\n\n", expanded_size.y));
+
+    for (tab_index, tab) in tabs.iter().enumerate() {
+        output.push_str(&format!("[tab.{}]\n", tab_index + 1));
+        output.push_str(&format!("name={}\n\n", escape_ini_value(&tab.name)));
+
+        for (item_index, item) in tab.items.iter().enumerate() {
+            let editable_item = EditableActionItem::from_action_item(item);
+
+            output.push_str(&format!(
+                "[tab.{}.item.{}]\n",
+                tab_index + 1,
+                item_index + 1
+            ));
+            output.push_str(&format!("kind={}\n", editable_item.kind.ini_value()));
+            output.push_str(&format!("name={}\n", escape_ini_value(&editable_item.name)));
+
+            match editable_item.kind {
+                ActionKind::CopyText => {
+                    output.push_str(&format!("text={}\n", escape_ini_value(&editable_item.text)));
+                }
+                ActionKind::RunApplication => {
+                    output.push_str(&format!(
+                        "command={}\n",
+                        escape_ini_value(&editable_item.command)
+                    ));
+                    output.push_str(&format!(
+                        "arguments={}\n",
+                        escape_ini_value(&editable_item.arguments)
+                    ));
+                }
+                ActionKind::OpenPath => {
+                    output.push_str(&format!("path={}\n", escape_ini_value(&editable_item.path)));
+                }
+            }
+
+            output.push('\n');
+        }
+    }
+
+    output
+}
+
+fn escape_ini_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
+fn parse_expanded_size_from_ini(configuration_text: &str) -> Option<egui::Vec2> {
+    let sections = parse_ini_sections(configuration_text).ok()?;
+    let (_, properties) = sections
+        .iter()
+        .find(|(section_name, _)| section_name.eq_ignore_ascii_case("layout"))?;
+
+    let width = optional_ini_value(properties, "expanded_width")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(EXPANDED_WIDTH);
+    let height = optional_ini_value(properties, "expanded_height")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(EXPANDED_HEIGHT);
+
+    Some(clamp_expanded_size(egui::vec2(width, height)))
+}
+
+fn parse_tabs_from_ini(configuration_text: &str) -> Result<Vec<QuickDockTab>, String> {
+    let sections = parse_ini_sections(configuration_text)?;
+    let has_tab_sections = sections
+        .iter()
+        .any(|(section_name, _)| section_name.to_ascii_lowercase().starts_with("tab."));
+
+    if !has_tab_sections {
+        return Ok(vec![QuickDockTab::new(
+            "기본".to_owned(),
+            parse_items_from_sections(&sections)?,
+        )]);
+    }
+
+    let mut tab_names = BTreeMap::<usize, String>::new();
+    let mut tab_items = BTreeMap::<usize, Vec<ActionItem>>::new();
+
+    for (section_name, properties) in sections {
+        let lower_section_name = section_name.to_ascii_lowercase();
+        if !lower_section_name.starts_with("tab.") {
+            continue;
+        }
+
+        let section_parts: Vec<&str> = lower_section_name.split('.').collect();
+        let Some(tab_number) = section_parts
+            .get(1)
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+
+        if section_parts.len() == 2 {
+            let name = optional_ini_value(&properties, "name")
+                .unwrap_or_else(|| format!("탭 {tab_number}"));
+            tab_names.insert(tab_number, name);
+        } else if section_parts.len() >= 4 && section_parts[2] == "item" {
+            tab_items
+                .entry(tab_number)
+                .or_default()
+                .push(parse_action_item_from_properties(
+                    &section_name,
+                    &properties,
+                )?);
+        }
+    }
+
+    let mut tab_numbers: Vec<usize> = tab_names.keys().chain(tab_items.keys()).copied().collect();
+    tab_numbers.sort_unstable();
+    tab_numbers.dedup();
+
+    let mut tabs = Vec::new();
+    for tab_number in tab_numbers {
+        let name = tab_names
+            .remove(&tab_number)
+            .unwrap_or_else(|| format!("탭 {tab_number}"));
+        let items = tab_items.remove(&tab_number).unwrap_or_default();
+        tabs.push(QuickDockTab::new(name, items));
+    }
+
+    if tabs.is_empty() {
+        tabs.push(QuickDockTab::new("기본".to_owned(), Vec::new()));
+    }
+
+    Ok(tabs)
+}
+
+fn parse_ini_sections(
+    configuration_text: &str,
+) -> Result<Vec<(String, BTreeMap<String, String>)>, String> {
+    let mut sections: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    let mut current_section_name: Option<String> = None;
+    let mut current_properties = BTreeMap::new();
+
+    for (line_index, raw_line) in configuration_text.lines().enumerate() {
+        let line = raw_line.trim();
+
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some(section_name) = current_section_name.replace(
+                line.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim()
+                    .to_owned(),
+            ) {
+                sections.push((section_name, std::mem::take(&mut current_properties)));
+            }
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("{}번째 줄에 '='가 없습니다.", line_index + 1));
+        };
+
+        if current_section_name.is_none() {
+            return Err(format!("{}번째 줄이 섹션 밖에 있습니다.", line_index + 1));
+        }
+
+        current_properties.insert(
+            key.trim().to_ascii_lowercase(),
+            normalize_ini_value(value.trim()),
+        );
+    }
+
+    if let Some(section_name) = current_section_name {
+        sections.push((section_name, current_properties));
+    }
+
+    Ok(sections)
+}
+
+fn parse_items_from_sections(
+    sections: &[(String, BTreeMap<String, String>)],
+) -> Result<Vec<ActionItem>, String> {
+    let mut items = Vec::new();
+    for (section_name, properties) in sections.iter() {
+        if !section_name.to_ascii_lowercase().starts_with("item") {
+            continue;
+        }
+
+        items.push(parse_action_item_from_properties(section_name, properties)?);
+    }
+
+    Ok(items)
+}
+
+fn parse_action_item_from_properties(
+    section_name: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<ActionItem, String> {
+    let kind = required_ini_value(properties, "kind", section_name)?;
+    let name = required_ini_value(properties, "name", section_name)?;
+
+    match kind.as_str() {
+        "copy_text" => Ok(ActionItem::CopyText {
+            name,
+            text: required_ini_value(properties, "text", section_name)?,
+        }),
+        "run_app" => Ok(ActionItem::RunApplication {
+            name,
+            command: required_ini_value(properties, "command", section_name)?,
+            arguments: optional_ini_value(properties, "arguments")
+                .map(|value| parse_argument_list(&value))
+                .unwrap_or_default(),
+        }),
+        "open_path" => Ok(ActionItem::OpenPath {
+            name,
+            path: required_ini_value(properties, "path", section_name)?,
+        }),
+        _ => Err(format!(
+            "[{section_name}]의 kind '{kind}'를 알 수 없습니다."
+        )),
+    }
+}
+
+fn required_ini_value(
+    properties: &BTreeMap<String, String>,
+    key: &str,
+    section_name: &str,
+) -> Result<String, String> {
+    properties
+        .get(key)
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("[{section_name}]에 {key} 값이 없습니다."))
+}
+
+fn optional_ini_value(properties: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    properties
+        .get(key)
+        .cloned()
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_argument_list(value: &str) -> Vec<String> {
+    value
+        .split('|')
+        .map(str::trim)
+        .filter(|argument| !argument.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_ini_value(value: &str) -> String {
+    let trimmed_value = value.trim();
+    let unquoted_value = if trimmed_value.len() >= 2
+        && trimmed_value.starts_with('"')
+        && trimmed_value.ends_with('"')
+    {
+        &trimmed_value[1..trimmed_value.len() - 1]
+    } else {
+        trimmed_value
+    };
+
+    unescape_ini_value(unquoted_value)
+}
+
+fn unescape_ini_value(value: &str) -> String {
+    let mut result = String::new();
+    let mut chars = value.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            result.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => result.push('\n'),
+            Some('r') => result.push('\r'),
+            Some('t') => result.push('\t'),
+            Some('\\') => result.push('\\'),
+            Some('"') => result.push('"'),
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+
+    result
+}
+
+fn get_default_ini_text() -> &'static str {
+    r#"; Quick Dock 설정 파일
+; 줄바꿈은 \n 으로 입력합니다.
+; 실행 인자는 arguments=a|b|c 처럼 | 로 구분합니다.
+
+[item.copy.review_done]
+kind=copy_text
+name=Jira - 검토 완료
+text=검토 완료했습니다.\n\n확인 내용:\n- \n\n조치 사항:\n- 없음\n\n특이 사항:\n- 없음\n
+
+[item.copy.need_detail]
+kind=copy_text
+name=Jira - 상세 설명 요청
+text=자세히 설명해 주세요.\n\n확인이 필요한 내용:\n- 재현 절차:\n- 기대 결과:\n- 실제 결과:\n- 관련 로그 또는 화면:\n
+
+[item.copy.action_log]
+kind=copy_text
+name=Jira - 조치 기록
+text=조치 내용:\n- \n\n원인:\n- \n\n변경 사항:\n- \n\n확인 결과:\n- 정상 확인\n
+
+[item.app.notepad]
+kind=run_app
+name=메모장 실행
+command=notepad.exe
+arguments=
+
+[item.path.downloads]
+kind=open_path
+name=다운로드 폴더 열기
+path=C:\Users\%USERNAME%\Downloads
+"#
+}
+
+fn get_default_items() -> Vec<ActionItem> {
+    vec![
+        ActionItem::CopyText {
+            name: "Jira - 검토 완료".to_owned(),
+            text: "검토 완료했습니다.\n\n확인 내용:\n- \n\n조치 사항:\n- 없음\n\n특이 사항:\n- 없음\n".to_owned(),
+        },
+        ActionItem::CopyText {
+            name: "Jira - 상세 설명 요청".to_owned(),
+            text: "자세히 설명해 주세요.\n\n확인이 필요한 내용:\n- 재현 절차:\n- 기대 결과:\n- 실제 결과:\n- 관련 로그 또는 화면:\n".to_owned(),
+        },
+        ActionItem::RunApplication {
+            name: "메모장 실행".to_owned(),
+            command: "notepad.exe".to_owned(),
+            arguments: Vec::new(),
+        },
+    ]
+}
+
+fn resolve_application_command(command: &str) -> String {
+    let command = trim_wrapping_quotes(command.trim());
+
+    if command.is_empty() || looks_like_path(command) {
+        return command.to_owned();
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(path) = find_windows_application_command(command) {
+        return path.to_string_lossy().into_owned();
+    }
+
+    command.to_owned()
+}
+
+fn trim_wrapping_quotes(text: &str) -> &str {
+    if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') {
+        &text[1..text.len() - 1]
+    } else {
+        text
+    }
+}
+
+fn looks_like_path(command: &str) -> bool {
+    command.contains('\\') || command.contains('/') || command.contains(':')
+}
+
+#[cfg(target_os = "windows")]
+fn find_windows_application_command(command: &str) -> Option<PathBuf> {
+    let command_names = windows_command_names(command);
+
+    if let Some(path) = find_command_in_path(&command_names) {
+        return Some(path);
+    }
+
+    for directory in windows_application_search_directories(command) {
+        for command_name in &command_names {
+            let candidate = directory.join(command_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_command_names(command: &str) -> Vec<String> {
+    let path = Path::new(command);
+
+    if path.extension().is_some() {
+        vec![command.to_owned()]
+    } else {
+        vec![command.to_owned(), format!("{command}.exe")]
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_command_in_path(command_names: &[String]) -> Option<PathBuf> {
+    let path_value = env::var_os("PATH")?;
+
+    for directory in env::split_paths(&path_value) {
+        for command_name in command_names {
+            let candidate = directory.join(command_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_application_search_directories(command: &str) -> Vec<PathBuf> {
+    let normalized_command = command.trim_end_matches(".exe");
+    let folder_names = known_windows_application_folder_names(normalized_command);
+    let roots = [
+        env::var_os("ProgramFiles"),
+        env::var_os("ProgramFiles(x86)"),
+        env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("Programs").into()),
+    ];
+    let mut directories = Vec::new();
+
+    for root in roots.into_iter().flatten() {
+        let root_path = PathBuf::from(root);
+        for folder_name in &folder_names {
+            directories.push(root_path.join(folder_name));
+        }
+    }
+
+    directories
+}
+
+#[cfg(target_os = "windows")]
+fn known_windows_application_folder_names(command_stem: &str) -> Vec<String> {
+    let mut folder_names = vec![command_stem.to_owned()];
+
+    if command_stem.eq_ignore_ascii_case("notepad++") {
+        folder_names.push("Notepad++".to_owned());
+    }
+
+    folder_names
+}
+
+fn expand_environment_variables(text: &str) -> String {
+    let mut expanded_text = String::new();
+    let mut remaining_text = text;
+
+    while let Some(start_index) = remaining_text.find('%') {
+        expanded_text.push_str(&remaining_text[..start_index]);
+        remaining_text = &remaining_text[start_index + 1..];
+
+        if let Some(end_index) = remaining_text.find('%') {
+            let variable_name = &remaining_text[..end_index];
+            if let Ok(variable_value) = env::var(variable_name) {
+                expanded_text.push_str(&variable_value);
+            } else {
+                expanded_text.push('%');
+                expanded_text.push_str(variable_name);
+                expanded_text.push('%');
+            }
+            remaining_text = &remaining_text[end_index + 1..];
+        } else {
+            expanded_text.push('%');
+            expanded_text.push_str(remaining_text);
+            return expanded_text;
+        }
+    }
+
+    expanded_text.push_str(remaining_text);
+    expanded_text
+}
