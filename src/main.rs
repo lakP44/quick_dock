@@ -270,6 +270,48 @@ impl EditableActionItem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationSeverity {
+    Ok,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct ValidationMessage {
+    severity: ValidationSeverity,
+    text: String,
+}
+
+impl ValidationMessage {
+    fn ok(text: impl Into<String>) -> Self {
+        Self {
+            severity: ValidationSeverity::Ok,
+            text: text.into(),
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            severity: ValidationSeverity::Warning,
+            text: text.into(),
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            severity: ValidationSeverity::Error,
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum EditorActionRequest {
+    Test(ActionItem),
+    Status { message: String, is_error: bool },
+}
+
 #[derive(Debug, Clone)]
 struct QuickDockTab {
     name: String,
@@ -920,6 +962,12 @@ impl QuickDockApplication {
     }
 
     fn save_settings_editor(&mut self) {
+        if let Some(error) = validate_editable_items_for_save(&self.active_tab().editable_items) {
+            self.last_status_message = error;
+            self.show_toast("설정을 확인하세요", true);
+            return;
+        }
+
         let items: Vec<ActionItem> = self
             .active_tab()
             .editable_items
@@ -932,7 +980,9 @@ impl QuickDockApplication {
 
         match save_tabs_to_configuration(&self.configuration_path, &self.tabs, self.expanded_size) {
             Ok(()) => {
-                self.last_status_message = "설정을 저장했습니다.".to_owned();
+                self.last_status_message =
+                    "설정을 저장했습니다. 이전 파일은 quick_dock.ini.bak에 백업했습니다."
+                        .to_owned();
                 self.is_settings_editor_open = false;
                 self.last_hovered_at = Instant::now();
             }
@@ -1481,6 +1531,7 @@ impl QuickDockApplication {
         let mut remove_index = None;
         let mut move_up_index = None;
         let mut move_down_index = None;
+        let mut editor_action_request = None;
         let item_count = self.active_tab().editable_items.len();
 
         egui::ScrollArea::vertical()
@@ -1498,7 +1549,9 @@ impl QuickDockApplication {
                         .default_open(index == 0)
                         .show(ui, |ui| {
                             let item = &mut self.active_tab_mut().editable_items[index];
-                            show_editable_action_item(ui, index, item);
+                            if let Some(request) = show_editable_action_item(ui, index, item) {
+                                editor_action_request = Some(request);
+                            }
                         });
 
                     response.header_response.context_menu(|ui| {
@@ -1538,6 +1591,18 @@ impl QuickDockApplication {
 
         if let Some(index) = remove_index {
             self.active_tab_mut().editable_items.remove(index);
+        }
+
+        if let Some(request) = editor_action_request {
+            match request {
+                EditorActionRequest::Test(item) => {
+                    self.execute_action(&item);
+                }
+                EditorActionRequest::Status { message, is_error } => {
+                    self.last_status_message = message.clone();
+                    self.show_toast(message, is_error);
+                }
+            }
         }
     }
 
@@ -1623,8 +1688,14 @@ impl QuickDockApplication {
     }
 
     fn run_application(&mut self, name: &str, command: &str, arguments: &[String]) {
-        let expanded_command = expand_environment_variables(command);
-        let resolved_command = resolve_application_command(&expanded_command);
+        let resolved_command = match resolve_application_command_for_spawn(command) {
+            Ok(resolved_command) => resolved_command,
+            Err(message) => {
+                self.last_status_message = format!("실행 실패: {message}");
+                self.show_toast("실행 실패", true);
+                return;
+            }
+        };
         let expanded_arguments: Vec<String> = arguments
             .iter()
             .map(|argument| expand_environment_variables(argument))
@@ -1636,15 +1707,27 @@ impl QuickDockApplication {
         {
             Ok(_) => {
                 self.last_status_message = format!("실행 완료: {name}");
+                self.show_toast("실행했습니다", false);
             }
             Err(error) => {
-                self.last_status_message = format!("실행 실패: {error} ({resolved_command})");
+                self.last_status_message = format!(
+                    "실행 실패: {}",
+                    describe_spawn_error(&error, &resolved_command)
+                );
+                self.show_toast("실행 실패", true);
             }
         }
     }
 
     fn open_path(&mut self, name: &str, path: &str) {
-        let expanded_path = expand_environment_variables(path);
+        let expanded_path = match resolve_open_path_for_spawn(path) {
+            Ok(expanded_path) => expanded_path,
+            Err(message) => {
+                self.last_status_message = format!("열기 실패: {message}");
+                self.show_toast("열기 실패", true);
+                return;
+            }
+        };
 
         #[cfg(target_os = "windows")]
         let result = Command::new("explorer.exe").arg(expanded_path).spawn();
@@ -1658,9 +1741,12 @@ impl QuickDockApplication {
         match result {
             Ok(_) => {
                 self.last_status_message = format!("열기 완료: {name}");
+                self.show_toast("열었습니다", false);
             }
             Err(error) => {
-                self.last_status_message = format!("열기 실패: {error}");
+                self.last_status_message =
+                    format!("열기 실패: {}", describe_spawn_error(&error, path));
+                self.show_toast("열기 실패", true);
             }
         }
     }
@@ -1985,7 +2071,13 @@ fn show_copy_text_preview(ui: &mut egui::Ui, name: &str, text: &str) {
         });
 }
 
-fn show_editable_action_item(ui: &mut egui::Ui, index: usize, item: &mut EditableActionItem) {
+fn show_editable_action_item(
+    ui: &mut egui::Ui,
+    index: usize,
+    item: &mut EditableActionItem,
+) -> Option<EditorActionRequest> {
+    let mut request = None;
+
     ui.horizontal(|ui| {
         ui.label("종류");
         egui::ComboBox::from_id_salt(("action_kind", index))
@@ -2004,21 +2096,319 @@ fn show_editable_action_item(ui: &mut egui::Ui, index: usize, item: &mut Editabl
         ActionKind::CopyText => {
             ui.label("복사할 내용");
             ui.add_sized(
-                [ui.available_width(), 96.0],
-                egui::TextEdit::multiline(&mut item.text),
+                [ui.available_width(), 180.0],
+                egui::TextEdit::multiline(&mut item.text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(9)
+                    .lock_focus(true),
             );
+
+            if ui.small_button("복사 테스트").clicked() {
+                request = Some(EditorActionRequest::Test(item.to_action_item()));
+            }
         }
         ActionKind::RunApplication => {
             ui.label("실행 파일 또는 명령");
-            ui.text_edit_singleline(&mut item.command);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut item.command)
+                        .desired_width((ui.available_width() - 96.0).max(140.0)),
+                );
+
+                if ui.small_button("찾아보기...").clicked() {
+                    match choose_executable_file() {
+                        Ok(Some(path)) => {
+                            item.command = path;
+                            request = Some(EditorActionRequest::Status {
+                                message: "실행 파일을 선택했습니다.".to_owned(),
+                                is_error: false,
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            request = Some(EditorActionRequest::Status {
+                                message: format!("파일 선택 실패: {error}"),
+                                is_error: true,
+                            });
+                        }
+                    }
+                }
+            });
+            show_validation_message(ui, &check_application_command(&item.command));
             ui.label("인자");
             ui.text_edit_singleline(&mut item.arguments);
+
+            if ui.small_button("테스트 실행").clicked() {
+                request = Some(EditorActionRequest::Test(item.to_action_item()));
+            }
         }
         ActionKind::OpenPath => {
             ui.label("파일/폴더 경로");
             ui.text_edit_singleline(&mut item.path);
+            show_validation_message(ui, &check_open_path(&item.path));
+
+            if ui.small_button("열기 테스트").clicked() {
+                request = Some(EditorActionRequest::Test(item.to_action_item()));
+            }
         }
     }
+
+    request
+}
+
+fn show_validation_message(ui: &mut egui::Ui, message: &ValidationMessage) {
+    let prefix = match message.severity {
+        ValidationSeverity::Ok => "확인",
+        ValidationSeverity::Warning => "주의",
+        ValidationSeverity::Error => "문제",
+    };
+
+    ui.colored_label(
+        validation_color(ui, message.severity),
+        format!("{prefix}: {}", message.text),
+    );
+}
+
+fn validation_color(ui: &egui::Ui, severity: ValidationSeverity) -> egui::Color32 {
+    match severity {
+        ValidationSeverity::Ok => egui::Color32::from_rgb(45, 150, 95),
+        ValidationSeverity::Warning => egui::Color32::from_rgb(188, 128, 35),
+        ValidationSeverity::Error => ui.visuals().error_fg_color,
+    }
+}
+
+fn validate_editable_items_for_save(items: &[EditableActionItem]) -> Option<String> {
+    for (index, item) in items.iter().enumerate() {
+        let item_number = index + 1;
+        let item_name = if item.name.trim().is_empty() {
+            "(이름 없음)"
+        } else {
+            item.name.trim()
+        };
+
+        if item.name.trim().is_empty() {
+            return Some(format!("{item_number}번째 항목: 이름이 비어 있습니다."));
+        }
+
+        let validation = match item.kind {
+            ActionKind::CopyText => {
+                if item.text.is_empty() {
+                    Some(ValidationMessage::warning("복사할 내용이 비어 있습니다."))
+                } else {
+                    None
+                }
+            }
+            ActionKind::RunApplication => Some(check_application_command(&item.command)),
+            ActionKind::OpenPath => Some(check_open_path(&item.path)),
+        };
+
+        if let Some(validation) = validation {
+            if validation.severity == ValidationSeverity::Error {
+                return Some(format!(
+                    "{item_number}번째 항목 '{item_name}' 저장 불가: {}",
+                    validation.text
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+fn check_application_command(command: &str) -> ValidationMessage {
+    let normalized_command = normalize_command_text(command);
+
+    if normalized_command.is_empty() {
+        return ValidationMessage::error("실행 파일 또는 명령이 비어 있습니다.");
+    }
+
+    if looks_like_path(&normalized_command) {
+        let command_path = Path::new(&normalized_command);
+
+        if command_path.is_file() {
+            return ValidationMessage::ok(format!(
+                "실행 파일을 확인했습니다: {}",
+                command_path.display()
+            ));
+        }
+
+        if command_path.is_dir() {
+            return ValidationMessage::error(format!(
+                "폴더입니다. 실행할 exe 파일을 선택하세요: {}",
+                command_path.display()
+            ));
+        }
+
+        return ValidationMessage::error(format!("파일이 없습니다: {}", command_path.display()));
+    }
+
+    if let Some(command_path) = find_application_command(&normalized_command) {
+        return ValidationMessage::ok(format!(
+            "PATH/Program Files에서 찾았습니다: {}",
+            command_path.display()
+        ));
+    }
+
+    ValidationMessage::error(format!(
+        "PATH 또는 Program Files에서 찾을 수 없습니다: {normalized_command}"
+    ))
+}
+
+fn check_open_path(path: &str) -> ValidationMessage {
+    let normalized_path = normalize_command_text(path);
+
+    if normalized_path.is_empty() {
+        return ValidationMessage::error("파일/폴더 경로가 비어 있습니다.");
+    }
+
+    if looks_like_url(&normalized_path) {
+        return ValidationMessage::warning(
+            "웹 주소는 존재 여부를 확인하지 않습니다. 열기 테스트로 확인하세요.",
+        );
+    }
+
+    let path = Path::new(&normalized_path);
+    if path.is_dir() {
+        return ValidationMessage::ok(format!("폴더를 확인했습니다: {}", path.display()));
+    }
+
+    if path.is_file() {
+        return ValidationMessage::ok(format!("파일을 확인했습니다: {}", path.display()));
+    }
+
+    ValidationMessage::error(format!("파일/폴더가 없습니다: {}", path.display()))
+}
+
+fn resolve_application_command_for_spawn(command: &str) -> Result<String, String> {
+    let normalized_command = normalize_command_text(command);
+
+    if normalized_command.is_empty() {
+        return Err("실행 파일 또는 명령이 비어 있습니다.".to_owned());
+    }
+
+    if looks_like_path(&normalized_command) {
+        let command_path = Path::new(&normalized_command);
+
+        if command_path.is_file() {
+            return Ok(normalized_command);
+        }
+
+        if command_path.is_dir() {
+            return Err(format!(
+                "폴더라서 실행할 수 없습니다. exe 파일을 선택하세요: {}",
+                command_path.display()
+            ));
+        }
+
+        return Err(format!("파일이 없습니다: {}", command_path.display()));
+    }
+
+    if let Some(command_path) = find_application_command(&normalized_command) {
+        return Ok(command_path.to_string_lossy().into_owned());
+    }
+
+    Err(format!(
+        "PATH 또는 Program Files에서 찾을 수 없습니다: {normalized_command}"
+    ))
+}
+
+fn resolve_open_path_for_spawn(path: &str) -> Result<String, String> {
+    let normalized_path = normalize_command_text(path);
+
+    if normalized_path.is_empty() {
+        return Err("파일/폴더 경로가 비어 있습니다.".to_owned());
+    }
+
+    if looks_like_url(&normalized_path) || Path::new(&normalized_path).exists() {
+        return Ok(normalized_path);
+    }
+
+    Err(format!(
+        "파일/폴더가 없습니다: {}",
+        Path::new(&normalized_path).display()
+    ))
+}
+
+fn normalize_command_text(text: &str) -> String {
+    let expanded_text = expand_environment_variables(text);
+    trim_wrapping_quotes(expanded_text.trim()).trim().to_owned()
+}
+
+fn looks_like_url(text: &str) -> bool {
+    let lower_text = text.to_ascii_lowercase();
+    lower_text.starts_with("http://")
+        || lower_text.starts_with("https://")
+        || lower_text.starts_with("mailto:")
+}
+
+fn describe_spawn_error(error: &std::io::Error, target: &str) -> String {
+    if let Some(error_code) = error.raw_os_error() {
+        match error_code {
+            2 | 3 => return format!("파일 없음: {target}"),
+            5 => return format!("권한 문제: 접근이 거부되었습니다. ({target})"),
+            193 => return format!("파일 형식 문제: 실행 가능한 Windows 앱이 아닙니다. ({target})"),
+            740 => return format!("권한 문제: 관리자 권한이 필요할 수 있습니다. ({target})"),
+            _ => {}
+        }
+    }
+
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("파일 또는 PATH 항목을 찾지 못했습니다. ({target})")
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            format!("권한 문제로 실행하지 못했습니다. ({target})")
+        }
+        std::io::ErrorKind::InvalidInput => format!("명령 또는 인자 형식 문제입니다. ({target})"),
+        _ => format!("{error} ({target})"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn choose_executable_file() -> std::io::Result<Option<String>> {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+[System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = '실행 파일 선택'
+$dialog.Filter = '실행 파일 (*.exe)|*.exe|모든 파일 (*.*)|*.*'
+$dialog.CheckFileExists = $true
+$dialog.Multiselect = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    Write-Output $dialog.FileName
+}
+"#;
+
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            if stderr.is_empty() {
+                format!("PowerShell 종료 코드: {}", output.status)
+            } else {
+                stderr
+            },
+        ));
+    }
+
+    let selected_path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if selected_path.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(selected_path))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn choose_executable_file() -> std::io::Result<Option<String>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "파일 선택은 Windows에서만 지원합니다.",
+    ))
 }
 
 fn run_explorer_cleanup() -> std::io::Result<()> {
@@ -2219,10 +2609,28 @@ fn save_tabs_to_configuration(
         fs::create_dir_all(parent)?;
     }
 
+    backup_configuration_file(configuration_path)?;
+
     fs::write(
         configuration_path,
         serialize_tabs_to_ini(tabs, expanded_size),
     )
+}
+
+fn backup_configuration_file(configuration_path: &Path) -> std::io::Result<()> {
+    if !configuration_path.exists() {
+        return Ok(());
+    }
+
+    let Some(file_name) = configuration_path.file_name() else {
+        return Ok(());
+    };
+
+    let backup_file_name = format!("{}.bak", file_name.to_string_lossy());
+    let backup_path = configuration_path.with_file_name(backup_file_name);
+    fs::copy(configuration_path, backup_path)?;
+
+    Ok(())
 }
 
 fn serialize_tabs_to_ini(tabs: &[QuickDockTab], expanded_size: egui::Vec2) -> String {
@@ -2232,6 +2640,7 @@ fn serialize_tabs_to_ini(tabs: &[QuickDockTab], expanded_size: egui::Vec2) -> St
     );
 
     output.push_str("[layout]\n");
+    output.push_str("schema_version=1\n");
     output.push_str(&format!("expanded_width={:.0}\n", expanded_size.x));
     output.push_str(&format!("expanded_height={:.0}\n\n", expanded_size.y));
 
@@ -2527,31 +2936,40 @@ fn unescape_ini_value(value: &str) -> String {
 
 fn get_default_ini_text() -> &'static str {
     r#"; Quick Dock 설정 파일
+; 앱 안의 설정 화면에서 편집할 수 있습니다.
 ; 줄바꿈은 \n 으로 입력합니다.
 ; 실행 인자는 arguments=a|b|c 처럼 | 로 구분합니다.
 
-[item.copy.review_done]
+[layout]
+schema_version=1
+expanded_width=350
+expanded_height=430
+
+[tab.1]
+name=기본
+
+[tab.1.item.1]
 kind=copy_text
 name=Jira - 검토 완료
 text=검토 완료했습니다.\n\n확인 내용:\n- \n\n조치 사항:\n- 없음\n\n특이 사항:\n- 없음\n
 
-[item.copy.need_detail]
+[tab.1.item.2]
 kind=copy_text
 name=Jira - 상세 설명 요청
 text=자세히 설명해 주세요.\n\n확인이 필요한 내용:\n- 재현 절차:\n- 기대 결과:\n- 실제 결과:\n- 관련 로그 또는 화면:\n
 
-[item.copy.action_log]
+[tab.1.item.3]
 kind=copy_text
 name=Jira - 조치 기록
 text=조치 내용:\n- \n\n원인:\n- \n\n변경 사항:\n- \n\n확인 결과:\n- 정상 확인\n
 
-[item.app.notepad]
+[tab.1.item.4]
 kind=run_app
 name=메모장 실행
 command=notepad.exe
 arguments=
 
-[item.path.downloads]
+[tab.1.item.5]
 kind=open_path
 name=다운로드 폴더 열기
 path=C:\Users\%USERNAME%\Downloads
@@ -2576,19 +2994,23 @@ fn get_default_items() -> Vec<ActionItem> {
     ]
 }
 
-fn resolve_application_command(command: &str) -> String {
-    let command = trim_wrapping_quotes(command.trim());
+#[cfg(target_os = "windows")]
+fn find_application_command(command: &str) -> Option<PathBuf> {
+    find_windows_application_command(command)
+}
 
-    if command.is_empty() || looks_like_path(command) {
-        return command.to_owned();
+#[cfg(not(target_os = "windows"))]
+fn find_application_command(command: &str) -> Option<PathBuf> {
+    let path_value = env::var_os("PATH")?;
+
+    for directory in env::split_paths(&path_value) {
+        let candidate = directory.join(command);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
     }
 
-    #[cfg(target_os = "windows")]
-    if let Some(path) = find_windows_application_command(command) {
-        return path.to_string_lossy().into_owned();
-    }
-
-    command.to_owned()
+    None
 }
 
 fn trim_wrapping_quotes(text: &str) -> &str {
