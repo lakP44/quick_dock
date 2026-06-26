@@ -1,11 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "windows")]
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
@@ -106,6 +110,26 @@ fn focus_existing_instance_window() {
         if !window.is_null() {
             ShowWindow(window, SW_SHOW);
             ShowWindow(window, SW_RESTORE);
+            SetForegroundWindow(window);
+        }
+    }
+}
+
+/// 트레이에서 창을 복원한다. 트레이 이벤트 핸들러는 메인 스레드 메시지 펌프에서
+/// 실행되므로, 창이 `Visible(false)`로 숨겨져 eframe의 update 루프가 멈춰 있어도
+/// 여기서 직접 창을 다시 표시하면 WM_PAINT가 발생해 update 루프가 깨어난다.
+#[cfg(target_os = "windows")]
+fn show_main_window() {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOW,
+    };
+
+    let title = wide_null(OsStr::new("Quick Dock"));
+    unsafe {
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !window.is_null() {
+            ShowWindow(window, SW_SHOW);
             SetForegroundWindow(window);
         }
     }
@@ -528,12 +552,28 @@ struct QuickDockApplication {
     tray_state: Option<TrayState>,
     #[cfg(target_os = "windows")]
     tray_attempted: bool,
+    #[cfg(target_os = "windows")]
+    tray_commands: Arc<Mutex<VecDeque<TrayCommand>>>,
 }
 
 #[cfg(target_os = "windows")]
 struct TrayState {
     _icon: tray_icon::TrayIcon,
     autostart_item: tray_icon::menu::CheckMenuItem,
+}
+
+/// 트레이 메뉴/아이콘 핸들러가 update 루프에 전달하는 명령.
+///
+/// 창을 숨기면 eframe가 `ui()`를 더 이상 호출하지 않으므로(메모리: 트레이는 창을 숨기지 않음 참고)
+/// 트레이 이벤트는 채널 폴링 대신 `set_event_handler`로 받아 이 큐에 쌓고, 메인 스레드 메시지
+/// 펌프에서 직접 창을 다시 표시해 update 루프를 깨운 뒤 처리한다.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy)]
+enum TrayCommand {
+    Open,
+    Settings,
+    ToggleAutostart,
+    Quit,
 }
 
 struct PaletteEntry {
@@ -620,6 +660,8 @@ impl QuickDockApplication {
             tray_state: None,
             #[cfg(target_os = "windows")]
             tray_attempted: false,
+            #[cfg(target_os = "windows")]
+            tray_commands: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -1942,8 +1984,30 @@ impl QuickDockApplication {
             self.pending_input_copy = None;
             self.last_status_message = "복사를 취소했습니다.".to_owned();
         } else {
+            self.hide_to_tray(context);
+        }
+    }
+
+    /// X 버튼: 종료하지 않고 트레이로 최소화한다. 트레이의 `종료`로만 완전히 끈다.
+    fn hide_to_tray(&mut self, context: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            // 트레이로 숨기기 전에 트레이 아이콘이 살아 있는지 확인한다.
+            // (없으면 다시 꺼낼 방법이 사라지므로 안전하게 그냥 종료한다.)
+            self.ensure_tray_icon(context);
+            if self.tray_state.is_some() {
+                context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.last_status_message =
+                    "트레이로 최소화했습니다. 트레이 아이콘에서 다시 열 수 있습니다.".to_owned();
+                return;
+            }
+            // 트레이 아이콘이 없으면 다시 꺼낼 방법이 없으므로 안전하게 종료한다.
+            log_event("트레이 아이콘이 없어 X를 종료로 처리");
             context.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+
+        #[cfg(not(target_os = "windows"))]
+        context.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     fn show_tab_strip(&mut self, ui: &mut egui::Ui) {
@@ -2320,48 +2384,55 @@ impl QuickDockApplication {
         }
     }
 
-    fn ensure_tray_icon(&mut self) {
+    fn ensure_tray_icon(&mut self, context: &egui::Context) {
         #[cfg(target_os = "windows")]
         {
             if self.tray_state.is_some() || self.tray_attempted {
                 return;
             }
             self.tray_attempted = true;
-            match build_tray_state(self.autostart_enabled) {
+            match build_tray_state(
+                self.autostart_enabled,
+                context.clone(),
+                self.tray_commands.clone(),
+            ) {
                 Ok(state) => self.tray_state = Some(state),
                 Err(error) => log_event(&format!("트레이 아이콘 생성 실패: {error}")),
             }
         }
+
+        #[cfg(not(target_os = "windows"))]
+        let _ = context;
     }
 
     fn poll_tray_events(&mut self, context: &egui::Context) {
         #[cfg(target_os = "windows")]
         {
-            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-                if event.id == "tray_open" {
-                    self.bring_to_front(context);
-                } else if event.id == "tray_settings" {
-                    self.bring_to_front(context);
-                    if !self.is_settings_editor_open {
-                        self.open_settings_editor();
-                    }
-                } else if event.id == "tray_autostart" {
-                    self.toggle_autostart();
-                    if let Some(state) = &self.tray_state {
-                        state.autostart_item.set_checked(self.autostart_enabled);
-                    }
-                } else if event.id == "tray_quit" {
-                    context.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
+            // 핸들러가 쌓아 둔 명령을 비운다. (메뉴/아이콘 이벤트는 채널이 아니라
+            // set_event_handler로 받아 tray_commands 큐에 들어온다.)
+            let commands: Vec<TrayCommand> = match self.tray_commands.lock() {
+                Ok(mut queue) => queue.drain(..).collect(),
+                Err(_) => return,
+            };
 
-            while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
-                if let tray_icon::TrayIconEvent::Click {
-                    button: tray_icon::MouseButton::Left,
-                    ..
-                } = event
-                {
-                    self.bring_to_front(context);
+            for command in commands {
+                match command {
+                    TrayCommand::Open => self.bring_to_front(context),
+                    TrayCommand::Settings => {
+                        self.bring_to_front(context);
+                        if !self.is_settings_editor_open {
+                            self.open_settings_editor();
+                        }
+                    }
+                    TrayCommand::ToggleAutostart => {
+                        self.toggle_autostart();
+                        if let Some(state) = &self.tray_state {
+                            state.autostart_item.set_checked(self.autostart_enabled);
+                        }
+                    }
+                    TrayCommand::Quit => {
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             }
         }
@@ -2712,7 +2783,7 @@ impl eframe::App for QuickDockApplication {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
-        self.ensure_tray_icon();
+        self.ensure_tray_icon(&context);
         self.poll_tray_events(&context);
         self.update_window_state(&context, frame);
 
@@ -3656,9 +3727,55 @@ fn set_autostart(_enabled: bool) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn build_tray_state(autostart_enabled: bool) -> Result<TrayState, String> {
-    use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
-    use tray_icon::TrayIconBuilder;
+fn build_tray_state(
+    autostart_enabled: bool,
+    context: egui::Context,
+    commands: Arc<Mutex<VecDeque<TrayCommand>>>,
+) -> Result<TrayState, String> {
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    // 메뉴/아이콘 이벤트를 update 루프 밖(메인 스레드 메시지 펌프)에서 받는다.
+    // 창이 숨겨져 ui()가 멈춰도 핸들러는 호출되므로, 명령을 큐에 넣고 창을 다시 표시해
+    // update 루프를 깨운다. (request_repaint는 창이 보일 때의 즉시 처리를 위한 보조 수단)
+    let menu_commands = commands.clone();
+    let menu_context = context.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let command = if event.id == "tray_open" {
+            TrayCommand::Open
+        } else if event.id == "tray_settings" {
+            TrayCommand::Settings
+        } else if event.id == "tray_autostart" {
+            TrayCommand::ToggleAutostart
+        } else if event.id == "tray_quit" {
+            TrayCommand::Quit
+        } else {
+            return;
+        };
+        if let Ok(mut queue) = menu_commands.lock() {
+            queue.push_back(command);
+        }
+        show_main_window();
+        menu_context.request_repaint();
+    }));
+
+    let icon_commands = commands;
+    let icon_context = context;
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        // 왼쪽 버튼을 뗄 때 한 번만 창을 복원한다.
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            if let Ok(mut queue) = icon_commands.lock() {
+                queue.push_back(TrayCommand::Open);
+            }
+            show_main_window();
+            icon_context.request_repaint();
+        }
+    }));
 
     let menu = Menu::new();
     let open_item = MenuItem::with_id("tray_open", "열기", true, None);
